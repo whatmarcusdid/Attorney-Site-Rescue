@@ -132,6 +132,46 @@ describe("scanHomePage", () => {
     expect(session.evaluate).not.toHaveBeenCalled();
   });
 
+  it("returns partial when page.content hangs past the first-results budget", async () => {
+    jest.useFakeTimers();
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession({
+      content: jest.fn(() => new Promise(() => undefined)),
+    });
+
+    const pending = scanHomePage("https://example.com");
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+      stage: "html",
+    });
+    expect(result.outcome).not.toBe("complete");
+    expect(session.close).toHaveBeenCalled();
+    expect(session.addScriptTag).not.toHaveBeenCalled();
+    expect(session.evaluate).not.toHaveBeenCalled();
+  });
+
+  it("does not complete when goto lands on a blocked address", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession({ finalUrl: "http://127.0.0.1/" });
+
+    const result = await scanHomePage("https://example.com");
+
+    expect(result.outcome).not.toBe("complete");
+    expect(result).toMatchObject({
+      outcome: "rejected",
+      reason: "BLOCKED_ADDRESS",
+      stage: "url_safety",
+    });
+    expect(session.content).not.toHaveBeenCalled();
+    expect(session.addScriptTag).not.toHaveBeenCalled();
+    expect(session.evaluate).not.toHaveBeenCalled();
+    expect(session.close).toHaveBeenCalled();
+  });
+
   it.each([
     [202, "HTTP_202"],
     [403, "HTTP_403"],

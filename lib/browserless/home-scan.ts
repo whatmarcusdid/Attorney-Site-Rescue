@@ -21,7 +21,10 @@ import {
  * Home-page Browserless client for first results.
  *
  * One puppeteer-core WebSocket session: connect, goto the home page, optional
- * inline axe, then close. Limits live on URL_SAFETY_BOUNDS and come from
+ * inline axe, then close. After goto, the final URL is checked again before
+ * HTML or axe. HTML and axe are raced against the time left in
+ * firstResultsBudgetMs. The Browserless session timeout stays the provider
+ * kill switch. Limits live on URL_SAFETY_BOUNDS and come from
  * Public audit A1:
  * https://app.notion.com/p/4217eae312ee81b6904cc6dd84852057
  *
@@ -260,6 +263,44 @@ function classifyThrown(
   });
 }
 
+function firstResultsBudgetError(
+  stage: Exclude<HomeScanStage, "config">,
+): Error & { stage: Exclude<HomeScanStage, "config"> } {
+  return Object.assign(new Error("First-results budget exhausted"), {
+    name: "FirstResultsBudgetError",
+    stage,
+  });
+}
+
+function isFirstResultsBudgetError(
+  error: unknown,
+): error is Error & { stage: Exclude<HomeScanStage, "config"> } {
+  return error instanceof Error && error.name === "FirstResultsBudgetError";
+}
+
+async function raceFirstResultsBudget<T>(
+  work: Promise<T>,
+  remainingMs: number,
+  stageAtStop: () => Exclude<HomeScanStage, "config">,
+): Promise<T> {
+  if (remainingMs <= 0) {
+    throw firstResultsBudgetError(stageAtStop());
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(firstResultsBudgetError(stageAtStop()));
+        }, remainingMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function connectWithTimeout(endpoint: string): Promise<Browser> {
   const connect = resolveConnect();
   let timedOut = false;
@@ -395,6 +436,18 @@ export async function scanHomePage(
 
     const httpStatus = response.status();
     const finalUrl = response.url();
+    const landed = await assessUrlSafety(finalUrl, {
+      lookup: options.lookup,
+    });
+    if (!landed.ok) {
+      return {
+        outcome: "rejected",
+        reason: landed.reasonCode,
+        stage: "url_safety",
+        customerMessage: landed.customerMessage,
+      };
+    }
+
     let redirectCount = 0;
     try {
       redirectCount = response.request().redirectChain().length;
@@ -422,81 +475,125 @@ export async function scanHomePage(
       });
     }
 
-    stage = "html";
-    const rawHtml = await page.content();
-    const capped = capHtml(rawHtml, URL_SAFETY_BOUNDS.maxResponseBytes);
-    if (capped.truncated) {
+    const remainingMs = URL_SAFETY_BOUNDS.firstResultsBudgetMs - elapsed();
+    if (remainingMs <= 0) {
       return partialResult({
-        reason: "RESPONSE_TOO_LARGE",
+        reason: "FIRST_RESULTS_BUDGET",
         stage: "html",
         httpStatus,
         finalUrl,
-        html: capped.html,
+        detail: redactProviderSecrets("First-results budget exhausted"),
         elapsedMs: elapsed(),
       });
     }
 
-    if (httpStatus !== 200) {
-      return partialResult({
-        reason: partialReasonForHttpStatus(httpStatus),
-        stage: "goto",
-        httpStatus,
-        finalUrl,
-        html: capped.html,
-        elapsedMs: elapsed(),
-      });
-    }
-
-    const remaining = URL_SAFETY_BOUNDS.firstResultsBudgetMs - elapsed();
-    if (remaining < URL_SAFETY_BOUNDS.axeMinRemainingMs) {
-      return {
-        outcome: "complete",
-        httpStatus: 200,
-        finalUrl,
-        html: capped.html,
-        axe: { status: "skipped", skipReason: "insufficient_budget" },
-        elapsedMs: elapsed(),
-      };
-    }
-
-    stage = "axe";
+    stage = "html";
     try {
-      const axeResult = await runAxe(page);
-      const violationCount = Array.isArray(axeResult?.violations)
-        ? axeResult.violations.length
-        : 0;
-      return {
-        outcome: "complete",
-        httpStatus: 200,
-        finalUrl,
-        html: capped.html,
-        axe: { status: "ran", violationCount },
-        elapsedMs: elapsed(),
-      };
+      return await raceFirstResultsBudget(
+        (async (): Promise<HomeScanResult> => {
+          const rawHtml = await page.content();
+          const capped = capHtml(rawHtml, URL_SAFETY_BOUNDS.maxResponseBytes);
+          if (capped.truncated) {
+            return partialResult({
+              reason: "RESPONSE_TOO_LARGE",
+              stage: "html",
+              httpStatus,
+              finalUrl,
+              html: capped.html,
+              elapsedMs: elapsed(),
+            });
+          }
+
+          if (httpStatus !== 200) {
+            return partialResult({
+              reason: partialReasonForHttpStatus(httpStatus),
+              stage: "goto",
+              httpStatus,
+              finalUrl,
+              html: capped.html,
+              elapsedMs: elapsed(),
+            });
+          }
+
+          const leftForAxe =
+            URL_SAFETY_BOUNDS.firstResultsBudgetMs - elapsed();
+          if (leftForAxe < URL_SAFETY_BOUNDS.axeMinRemainingMs) {
+            return {
+              outcome: "complete",
+              httpStatus: 200,
+              finalUrl,
+              html: capped.html,
+              axe: { status: "skipped", skipReason: "insufficient_budget" },
+              elapsedMs: elapsed(),
+            };
+          }
+
+          stage = "axe";
+          try {
+            const axeResult = await runAxe(page);
+            const violationCount = Array.isArray(axeResult?.violations)
+              ? axeResult.violations.length
+              : 0;
+            return {
+              outcome: "complete",
+              httpStatus: 200,
+              finalUrl,
+              html: capped.html,
+              axe: { status: "ran", violationCount },
+              elapsedMs: elapsed(),
+            };
+          } catch (error) {
+            if (isFirstResultsBudgetError(error)) {
+              throw error;
+            }
+            if (isDestroyedContext(error) || isSessionFailure(error)) {
+              const stopped = classifyThrown(error, "axe", elapsed());
+              if (stopped.outcome === "partial") {
+                return {
+                  ...stopped,
+                  httpStatus,
+                  finalUrl,
+                  html: capped.html,
+                };
+              }
+              return stopped;
+            }
+            const skipReason = isTimeoutError(error) ? "timeout" : "evaluate_failed";
+            return {
+              outcome: "complete",
+              httpStatus: 200,
+              finalUrl,
+              html: capped.html,
+              axe: { status: "skipped", skipReason },
+              elapsedMs: elapsed(),
+            };
+          }
+        })(),
+        remainingMs,
+        () => stage,
+      );
     } catch (error) {
-      if (isDestroyedContext(error) || isSessionFailure(error)) {
-        const stopped = classifyThrown(error, "axe", elapsed());
-        if (stopped.outcome === "partial") {
-          return {
-            ...stopped,
-            httpStatus,
-            finalUrl,
-            html: capped.html,
-          };
-        }
-        return stopped;
+      if (isFirstResultsBudgetError(error)) {
+        return partialResult({
+          reason: "FIRST_RESULTS_BUDGET",
+          stage: error.stage,
+          httpStatus,
+          finalUrl,
+          detail: redactProviderSecrets(errorText(error)),
+          elapsedMs: elapsed(),
+        });
       }
-      const skipReason = isTimeoutError(error) ? "timeout" : "evaluate_failed";
-      return {
-        outcome: "complete",
-        httpStatus: 200,
-        finalUrl,
-        html: capped.html,
-        axe: { status: "skipped", skipReason },
-        elapsedMs: elapsed(),
-      };
+      throw error;
     }
   } catch (error) {
+    if (isFirstResultsBudgetError(error)) {
+      return partialResult({
+        reason: "FIRST_RESULTS_BUDGET",
+        stage: error.stage,
+        detail: redactProviderSecrets(errorText(error)),
+        elapsedMs: elapsed(),
+      });
+    }
     return classifyThrown(error, stage, elapsed());
   } finally {
     if (browser) {

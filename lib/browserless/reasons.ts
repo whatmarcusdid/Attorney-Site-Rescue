@@ -133,6 +133,7 @@ export const HOME_SCAN_PARTIAL_REASONS = [
   "TOO_MANY_REDIRECTS",
   "LOAD_FAILED",
   "PROVIDER_ERROR",
+  "FIRST_RESULTS_BUDGET",
 ] as const;
 
 export type HomeScanPartialReason = (typeof HOME_SCAN_PARTIAL_REASONS)[number];
@@ -161,7 +162,8 @@ export function customerMessageForPartial(input: {
   if (
     input.reason === "CONNECT_TIMEOUT" ||
     input.reason === "LOAD_TIMEOUT" ||
-    input.reason === "SESSION_TIMEOUT"
+    input.reason === "SESSION_TIMEOUT" ||
+    input.reason === "FIRST_RESULTS_BUDGET"
   ) {
     return CUSTOMER_MESSAGES.FETCH_TIMEOUT;
   }

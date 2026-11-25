@@ -7,8 +7,11 @@
  * The synchronous path is the home page only. page.goto waits until
  * domcontentloaded and aborts at gotoHardTimeoutMs. gotoTargetMs is the
  * page-load goal from that spike; it does not abort a load that is still
- * inside the hard limit. Axe runs inline only after HTTP 200 and only when
- * at least axeMinRemainingMs of firstResultsBudgetMs remain.
+ * inside the hard limit. firstResultsBudgetMs is the hard stop for first
+ * results: after goto, reading HTML and running axe are raced against whatever
+ * remains of that budget. Axe still runs inline only after HTTP 200 and only
+ * when at least axeMinRemainingMs remain. sessionTimeoutMs stays the provider
+ * kill switch.
  */
 export interface UrlSafetyBounds {
   allowedPorts: readonly number[];
