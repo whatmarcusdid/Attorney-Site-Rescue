@@ -436,17 +436,6 @@ export async function scanHomePage(
 
     const httpStatus = response.status();
     const finalUrl = response.url();
-    const landed = await assessUrlSafety(finalUrl, {
-      lookup: options.lookup,
-    });
-    if (!landed.ok) {
-      return {
-        outcome: "rejected",
-        reason: landed.reasonCode,
-        stage: "url_safety",
-        customerMessage: landed.customerMessage,
-      };
-    }
 
     let redirectCount = 0;
     try {
@@ -476,10 +465,12 @@ export async function scanHomePage(
     }
 
     const remainingMs = URL_SAFETY_BOUNDS.firstResultsBudgetMs - elapsed();
+
+    stage = "url_safety";
     if (remainingMs <= 0) {
       return partialResult({
         reason: "FIRST_RESULTS_BUDGET",
-        stage: "html",
+        stage: "url_safety",
         httpStatus,
         finalUrl,
         detail: redactProviderSecrets("First-results budget exhausted"),
@@ -487,10 +478,46 @@ export async function scanHomePage(
       });
     }
 
-    stage = "html";
     try {
       return await raceFirstResultsBudget(
         (async (): Promise<HomeScanResult> => {
+          stage = "url_safety";
+          let pageUrl = "";
+          try {
+            pageUrl = page.url();
+          } catch (error) {
+            if (isDestroyedContext(error)) {
+              return partialResult({
+                reason: "EXECUTION_CONTEXT_DESTROYED",
+                stage: "url_safety",
+                httpStatus,
+                finalUrl,
+                detail: redactProviderSecrets(errorText(error)),
+                elapsedMs: elapsed(),
+              });
+            }
+            throw error;
+          }
+
+          const landedUrls = [finalUrl];
+          if (pageUrl && pageUrl !== finalUrl) {
+            landedUrls.push(pageUrl);
+          }
+          for (const candidate of landedUrls) {
+            const landed = await assessUrlSafety(candidate, {
+              lookup: options.lookup,
+            });
+            if (!landed.ok) {
+              return {
+                outcome: "rejected",
+                reason: landed.reasonCode,
+                stage: "url_safety",
+                customerMessage: landed.customerMessage,
+              };
+            }
+          }
+
+          stage = "html";
           const rawHtml = await page.content();
           const capped = capHtml(rawHtml, URL_SAFETY_BOUNDS.maxResponseBytes);
           if (capped.truncated) {

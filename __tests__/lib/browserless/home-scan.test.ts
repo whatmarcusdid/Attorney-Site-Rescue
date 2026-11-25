@@ -38,6 +38,7 @@ function mockSession(options?: {
   html?: string;
   finalUrl?: string;
   redirects?: number;
+  pageUrl?: string;
   goto?: jest.Mock;
   evaluate?: jest.Mock;
   content?: jest.Mock;
@@ -49,6 +50,9 @@ function mockSession(options?: {
     options?.content ??
     jest.fn().mockResolvedValue(options?.html ?? "<html><body>ok</body></html>");
   const setUserAgent = jest.fn().mockResolvedValue(undefined);
+  const url = jest.fn(
+    () => options?.pageUrl ?? options?.finalUrl ?? "https://example.com/",
+  );
   const goto =
     options?.goto ??
     jest.fn().mockResolvedValue({
@@ -59,7 +63,7 @@ function mockSession(options?: {
       }),
     });
   const close = jest.fn().mockResolvedValue(undefined);
-  const page = { setUserAgent, goto, content, addScriptTag, evaluate };
+  const page = { setUserAgent, goto, content, addScriptTag, evaluate, url };
   const browser = {
     newPage: jest.fn().mockResolvedValue(page),
     close,
@@ -196,7 +200,18 @@ describe("scanHomePage", () => {
   it("returns partial when connect exceeds the 2000 ms limit", async () => {
     jest.useFakeTimers();
     process.env.BROWSERLESS_API_KEY = FAKE_KEY;
-    connectMock().mockImplementation(() => new Promise(() => undefined));
+    const lateClose = jest.fn().mockResolvedValue(undefined);
+    connectMock().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            resolve({
+              newPage: jest.fn(),
+              close: lateClose,
+            });
+          }, URL_SAFETY_BOUNDS.connectTimeoutMs + 1_000);
+        }),
+    );
 
     const pending = scanHomePage("https://example.com");
     await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.connectTimeoutMs);
@@ -207,6 +222,129 @@ describe("scanHomePage", () => {
       reason: "CONNECT_TIMEOUT",
       stage: "connect",
     });
+    expect(lateClose).not.toHaveBeenCalled();
+
+    await jest.advanceTimersByTimeAsync(1_000);
+    expect(lateClose).toHaveBeenCalled();
+  });
+
+  it("returns partial for HTTP 404 and does not run axe", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession({ status: 404 });
+
+    const result = await scanHomePage("https://example.com");
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "HTTP_NON_200",
+      httpStatus: 404,
+    });
+    expect(result.outcome).not.toBe("complete");
+    expect(session.addScriptTag).not.toHaveBeenCalled();
+    expect(session.evaluate).not.toHaveBeenCalled();
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it("rejects when the page URL moves to a blocked address after load", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession({
+      finalUrl: "https://example.com/",
+      pageUrl: "http://127.0.0.1/",
+    });
+
+    const result = await scanHomePage("https://example.com");
+
+    expect(result.outcome).not.toBe("complete");
+    expect(result).toMatchObject({
+      outcome: "rejected",
+      reason: "BLOCKED_ADDRESS",
+      stage: "url_safety",
+    });
+    expect(session.content).not.toHaveBeenCalled();
+    expect(session.addScriptTag).not.toHaveBeenCalled();
+    expect(session.evaluate).not.toHaveBeenCalled();
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it("returns partial when the post-goto lookup hangs past the first-results budget", async () => {
+    jest.useFakeTimers();
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession();
+    let lookups = 0;
+    const lookup = () => {
+      lookups += 1;
+      if (lookups === 1) return Promise.resolve(["93.184.216.34"]);
+      return new Promise<string[]>(() => undefined);
+    };
+
+    const pending = scanHomePage("https://example.com", { lookup });
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+      stage: "url_safety",
+    });
+    expect(result.outcome).not.toBe("complete");
+    expect(session.close).toHaveBeenCalled();
+    expect(session.addScriptTag).not.toHaveBeenCalled();
+    expect(session.content).not.toHaveBeenCalled();
+  });
+
+  it("returns rejected when the post-goto lookup throws", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession({
+      finalUrl: "https://cdn.example/",
+      pageUrl: "https://cdn.example/",
+    });
+
+    const result = await scanHomePage("https://example.com", {
+      lookup: async (hostname) => {
+        if (hostname === "cdn.example") {
+          throw new Error("ENOTFOUND");
+        }
+        return ["93.184.216.34"];
+      },
+    });
+
+    expect(result).toMatchObject({
+      outcome: "rejected",
+      reason: "DNS_FAILED",
+      stage: "url_safety",
+    });
+    expect(session.content).not.toHaveBeenCalled();
+    expect(session.addScriptTag).not.toHaveBeenCalled();
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it("opens one Browserless session for a 403", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    mockSession({ status: 403 });
+
+    await scanHomePage("https://example.com");
+
+    expect(connectMock()).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens one Browserless session for a load timeout", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    mockSession({
+      goto: jest.fn().mockRejectedValue(
+        Object.assign(new Error("Navigation timeout of 8000 ms exceeded"), {
+          name: "TimeoutError",
+        }),
+      ),
+    });
+
+    const result = await scanHomePage("https://example.com");
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "LOAD_TIMEOUT",
+      stage: "goto",
+    });
+    expect(connectMock()).toHaveBeenCalledTimes(1);
   });
 
   it("keeps a 200 page when axe itself times out", async () => {

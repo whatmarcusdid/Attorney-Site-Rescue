@@ -73,6 +73,9 @@ describe("partial HTTP reasons", () => {
     expect(
       customerMessageForPartial({ reason: "CONNECT_TIMEOUT" }),
     ).toBe("This website could not be reached.");
+    expect(
+      customerMessageForPartial({ reason: "FIRST_RESULTS_BUDGET" }),
+    ).toBe("This website could not be reached.");
   });
 });
 
