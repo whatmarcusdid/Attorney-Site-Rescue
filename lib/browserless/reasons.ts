@@ -21,51 +21,9 @@ export function customerMessageForFetch(
   return CUSTOMER_MESSAGES[code];
 }
 
-/** Distinct from URL-safety unsupported copy. Internal codes stay off this string. */
+/** Existing sentence for a 401 or 403 response. Internal codes stay off this string. */
 export const ACCESS_DENIED_CUSTOMER_MESSAGE =
   "This website's security settings are preventing us from completing a scan";
-
-const TARGET_ACCESS_DENIED_STATUSES = new Set([401, 403]);
-
-export function isTargetAccessDenied(
-  failureType?: string | null,
-  httpStatus?: number | null,
-): boolean {
-  return (
-    failureType === "NON_2XX_STATUS" &&
-    httpStatus != null &&
-    TARGET_ACCESS_DENIED_STATUSES.has(httpStatus)
-  );
-}
-
-export function terminalStateForHomeFetchFailure(
-  diagnostic: Pick<HomeFetchDiagnostic, "failureType" | "httpStatus">,
-): "unsupported" | "failed" {
-  return isTargetAccessDenied(diagnostic.failureType, diagnostic.httpStatus)
-    ? "unsupported"
-    : "failed";
-}
-
-export function customerMessageForHomeFetchFailure(
-  diagnostic: Pick<
-    HomeFetchDiagnostic,
-    "reasonCode" | "failureType" | "httpStatus"
-  >,
-): string {
-  if (isTargetAccessDenied(diagnostic.failureType, diagnostic.httpStatus)) {
-    return ACCESS_DENIED_CUSTOMER_MESSAGE;
-  }
-  if (
-    (HOME_PAGE_FETCH_REASON_CODES as readonly string[]).includes(
-      diagnostic.reasonCode,
-    )
-  ) {
-    return customerMessageForFetch(
-      diagnostic.reasonCode as HomePageFetchReasonCode,
-    );
-  }
-  return CUSTOMER_MESSAGES.FETCH_FAILED;
-}
 
 export const HOME_FETCH_FAILURE_TYPES = [
   "TIMEOUT",
