@@ -1,10 +1,12 @@
 /**
  * @jest-environment node
  */
+import { CRAWLER_USER_AGENT } from "@/lib/crawler/identity";
 import {
   assessUrlSafety,
   customerMessageFor,
   URL_SAFETY_BOUNDS,
+  URL_SAFETY_REASON_CODES,
 } from "@/lib/url-safety";
 
 const PUBLIC_IP = "93.184.216.34";
@@ -302,7 +304,110 @@ describe("assessUrlSafety", () => {
     await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.connectTimeoutMs);
     const result = await pending;
 
+    expect(result).toMatchObject({
+      ok: false,
+      reasonCode: "SITE_TIMEOUT",
+      customerMessage: "This website took too long to respond.",
+    });
+  });
+
+  it("returns SITE_TIMEOUT when an injected hop hangs past the connect bound", async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    const pending = assessUrlSafety("https://example.com", {
+      now: () => Date.now(),
+      deadline: URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      lookup: lookupOf([PUBLIC_IP]),
+      probe: () => new Promise(() => undefined),
+    });
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.connectTimeoutMs);
+    const result = await pending;
+
+    expect(Date.now()).toBe(URL_SAFETY_BOUNDS.connectTimeoutMs);
+
+    expect(result).toMatchObject({
+      ok: false,
+      reasonCode: "SITE_TIMEOUT",
+      customerMessage: "This website took too long to respond.",
+    });
+  });
+
+  it("returns DNS_FAILED when an injected hop is refused", async () => {
+    const result = await assessUrlSafety("https://example.com", {
+      now: () => 0,
+      lookup: lookupOf([PUBLIC_IP]),
+      probe: async () => {
+        throw Object.assign(new Error("connect ECONNREFUSED"), {
+          code: "ECONNREFUSED",
+        });
+      },
+    });
+
     expect(result).toMatchObject({ ok: false, reasonCode: "DNS_FAILED" });
+  });
+
+  it("returns SITE_TIMEOUT when DNS hangs past the connect bound", async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    let settled = false;
+    const pending = assessUrlSafety("https://example.com", {
+      now: () => Date.now(),
+      deadline: URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      lookup: () =>
+        new Promise((resolve) => {
+          setTimeout(() => resolve([PUBLIC_IP]), 3000);
+        }),
+    }).then((result) => {
+      settled = true;
+      return result;
+    });
+
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.connectTimeoutMs);
+    const result = await pending;
+
+    expect(settled).toBe(true);
+    expect(Date.now()).toBe(URL_SAFETY_BOUNDS.connectTimeoutMs);
+    expect(result).toMatchObject({
+      ok: false,
+      reasonCode: "SITE_TIMEOUT",
+      customerMessage: "This website took too long to respond.",
+    });
+    await jest.advanceTimersByTimeAsync(1000);
+  });
+
+  it("sends the crawler User-Agent on the redirect probe", async () => {
+    let userAgent: string | undefined;
+    global.fetch = jest.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string> | undefined;
+      userAgent = headers?.["User-Agent"];
+      return probeResponse(200);
+    }) as unknown as typeof fetch;
+
+    const result = await assessUrlSafety("https://example.com", {
+      lookup: lookupOf([PUBLIC_IP]),
+    });
+
+    expect(result.ok).toBe(true);
+    expect(userAgent).toBe(CRAWLER_USER_AGENT);
+  });
+
+  it("lists every safety reason code, including SITE_TIMEOUT", () => {
+    expect([...URL_SAFETY_REASON_CODES]).toEqual([
+      "INVALID_URL",
+      "DISALLOWED_PROTOCOL",
+      "DISALLOWED_PORT",
+      "CREDENTIALS_IN_URL",
+      "BLOCKED_HOST",
+      "BLOCKED_ADDRESS",
+      "DNS_FAILED",
+      "SITE_TIMEOUT",
+      "REDIRECT_BLOCKED",
+      "TOO_MANY_REDIRECTS",
+      "PROHIBITED_CONTENT",
+    ]);
+    expect(customerMessageFor("SITE_TIMEOUT")).toBe(
+      "This website took too long to respond.",
+    );
   });
 
   it("returns a safety result when the probe hits a network error", async () => {

@@ -333,7 +333,7 @@ describe("scanHomePage", () => {
     });
   });
 
-  it("returns partial when the post-goto lookup hangs past the first-results budget", async () => {
+  it("returns SITE_TIMEOUT when the post-goto lookup hangs past the connect bound", async () => {
     jest.useFakeTimers();
     process.env.BROWSERLESS_API_KEY = FAKE_KEY;
     const session = mockSession();
@@ -345,18 +345,143 @@ describe("scanHomePage", () => {
     };
 
     const pending = scanHomePage("https://example.com", { lookup });
-    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.connectTimeoutMs);
     const result = await pending;
 
     expect(result).toMatchObject({
-      outcome: "partial",
-      reason: "FIRST_RESULTS_BUDGET",
+      outcome: "rejected",
+      reason: "SITE_TIMEOUT",
       stage: "url_safety",
+      customerMessage: "This website took too long to respond.",
     });
     expect(result.outcome).not.toBe("complete");
     expect(session.close).toHaveBeenCalled();
     expect(session.addScriptTag).not.toHaveBeenCalled();
     expect(session.content).not.toHaveBeenCalled();
+  });
+
+  it("does not probe a loaded page and still rejects a private landed address", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession({
+      finalUrl: "https://example.com/",
+      pageUrl: "https://internal.example/",
+    });
+    const probed: string[] = [];
+    const probe = jest.fn(async (url: string) => {
+      probed.push(url);
+      return { status: 200 };
+    });
+
+    const result = await scanHomePage("https://example.com", {
+      now: () => 0,
+      probe,
+      lookup: async (hostname) => {
+        if (hostname === "internal.example") return ["10.0.0.5"];
+        return ["93.184.216.34"];
+      },
+    });
+
+    expect(probed).toEqual(["https://example.com/"]);
+    expect(result).toMatchObject({
+      outcome: "rejected",
+      reason: "BLOCKED_ADDRESS",
+      stage: "url_safety",
+    });
+    expect(session.content).not.toHaveBeenCalled();
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it("does not reject a loaded page when a later probe would hang", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    mockSession();
+    let calls = 0;
+    const probe = jest.fn(() => {
+      calls += 1;
+      if (calls > 1) return new Promise<never>(() => undefined);
+      return Promise.resolve({ status: 200 });
+    });
+
+    const result = await scanHomePage("https://example.com", {
+      now: () => 0,
+      probe,
+      lookup: async () => ["93.184.216.34"],
+    });
+
+    expect(calls).toBe(1);
+    expect(result).toMatchObject({
+      outcome: "complete",
+      httpStatus: 200,
+      finalUrl: "https://example.com/",
+    });
+  });
+
+  it("ends by the first-results deadline when hops and the page load are slow", async () => {
+    jest.useFakeTimers();
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    let clock = 0;
+    const now = () => clock;
+    const hopMs = 1900;
+    let hops = 0;
+    let gotoTimeout = -1;
+    const session = mockSession({
+      goto: jest.fn((_url: string, opts?: { timeout?: number }) => {
+        gotoTimeout = opts?.timeout ?? -1;
+        const timeLeftAtGoto =
+          URL_SAFETY_BOUNDS.firstResultsBudgetMs - hopMs * 4;
+        const pageLoadMs =
+          Math.min(URL_SAFETY_BOUNDS.gotoHardTimeoutMs, timeLeftAtGoto) - 1;
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            clock += pageLoadMs;
+            resolve({
+              status: () => 200,
+              url: () => "https://example.com/",
+              request: () => ({ redirectChain: () => [] }),
+            });
+          }, pageLoadMs);
+        });
+      }),
+    });
+    const probe = () =>
+      new Promise<{ status: number; location?: string }>((resolve) => {
+        setTimeout(() => {
+          clock += hopMs;
+          hops += 1;
+          if (hops < 4) {
+            resolve({
+              status: 302,
+              location: `https://example.com/hop${hops}`,
+            });
+          } else {
+            resolve({ status: 200 });
+          }
+        }, hopMs);
+      });
+
+    const pending = scanHomePage("https://example.com", {
+      now,
+      probe,
+      lookup: async () => ["93.184.216.34"],
+    });
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    const result = await pending;
+
+    const timeLeftAtGoto = URL_SAFETY_BOUNDS.firstResultsBudgetMs - hopMs * 4;
+    expect(gotoTimeout).toBe(
+      Math.min(URL_SAFETY_BOUNDS.gotoHardTimeoutMs, timeLeftAtGoto),
+    );
+    expect(clock).toBeLessThanOrEqual(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    expect(clock).toBeGreaterThan(
+      URL_SAFETY_BOUNDS.firstResultsBudgetMs -
+        URL_SAFETY_BOUNDS.axeMinRemainingMs,
+    );
+    expect(result).toMatchObject({
+      outcome: "complete",
+      axe: { status: "skipped", skipReason: "insufficient_budget" },
+    });
+    expect(session.addScriptTag).not.toHaveBeenCalled();
+    expect(session.evaluate).not.toHaveBeenCalled();
+    expect(session.close).toHaveBeenCalled();
   });
 
   it("returns rejected when the post-goto lookup throws", async () => {

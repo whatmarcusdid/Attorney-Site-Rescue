@@ -428,12 +428,17 @@ export async function scanHomePage(
   const started = now();
   const elapsed = () => Math.max(0, now() - started);
 
+  const safetyDeadline = started + URL_SAFETY_BOUNDS.firstResultsBudgetMs;
+  const safetyDeps = {
+    lookup: options.lookup,
+    probe: options.probe,
+    deadline: safetyDeadline,
+    now,
+  };
+
   let safety;
   try {
-    safety = await assessUrlSafety(input, {
-      lookup: options.lookup,
-      probe: options.probe,
-    });
+    safety = await assessUrlSafety(input, safetyDeps);
   } catch (error) {
     return partialResult({
       reason: "PROVIDER_ERROR",
@@ -499,7 +504,10 @@ export async function scanHomePage(
     try {
       response = await page.goto(safety.finalUrl, {
         waitUntil: "domcontentloaded",
-        timeout: URL_SAFETY_BOUNDS.gotoHardTimeoutMs,
+        timeout: Math.min(
+          URL_SAFETY_BOUNDS.gotoHardTimeoutMs,
+          Math.max(0, safetyDeadline - now()),
+        ),
       });
     } catch (error) {
       if (navigationStop) return navigationStop;
@@ -587,7 +595,8 @@ export async function scanHomePage(
           }
           for (const candidate of landedUrls) {
             const landed = await assessUrlSafety(candidate, {
-              lookup: options.lookup,
+              ...safetyDeps,
+              skipRedirectProbe: true,
             });
             if (!landed.ok) {
               return {
