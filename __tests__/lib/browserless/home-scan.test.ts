@@ -266,6 +266,22 @@ describe("scanHomePage", () => {
     expect(session.close).toHaveBeenCalled();
   });
 
+  it("reports the page URL when the page moves to another safe address", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    mockSession({
+      finalUrl: "https://example.com/",
+      pageUrl: "https://example.com/home",
+    });
+
+    const result = await scanHomePage("https://example.com");
+
+    expect(result).toMatchObject({
+      outcome: "complete",
+      httpStatus: 200,
+      finalUrl: "https://example.com/home",
+    });
+  });
+
   it("returns partial when the post-goto lookup hangs past the first-results budget", async () => {
     jest.useFakeTimers();
     process.env.BROWSERLESS_API_KEY = FAKE_KEY;

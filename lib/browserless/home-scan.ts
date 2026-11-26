@@ -465,6 +465,7 @@ export async function scanHomePage(
     }
 
     const remainingMs = URL_SAFETY_BOUNDS.firstResultsBudgetMs - elapsed();
+    let reportedUrl = finalUrl;
 
     stage = "url_safety";
     if (remainingMs <= 0) {
@@ -517,6 +518,10 @@ export async function scanHomePage(
             }
           }
 
+          const landedUrl =
+            pageUrl && pageUrl !== finalUrl ? pageUrl : finalUrl;
+          reportedUrl = landedUrl;
+
           stage = "html";
           const rawHtml = await page.content();
           const capped = capHtml(rawHtml, URL_SAFETY_BOUNDS.maxResponseBytes);
@@ -525,7 +530,7 @@ export async function scanHomePage(
               reason: "RESPONSE_TOO_LARGE",
               stage: "html",
               httpStatus,
-              finalUrl,
+              finalUrl: landedUrl,
               html: capped.html,
               elapsedMs: elapsed(),
             });
@@ -536,7 +541,7 @@ export async function scanHomePage(
               reason: partialReasonForHttpStatus(httpStatus),
               stage: "goto",
               httpStatus,
-              finalUrl,
+              finalUrl: landedUrl,
               html: capped.html,
               elapsedMs: elapsed(),
             });
@@ -548,7 +553,7 @@ export async function scanHomePage(
             return {
               outcome: "complete",
               httpStatus: 200,
-              finalUrl,
+              finalUrl: landedUrl,
               html: capped.html,
               axe: { status: "skipped", skipReason: "insufficient_budget" },
               elapsedMs: elapsed(),
@@ -564,7 +569,7 @@ export async function scanHomePage(
             return {
               outcome: "complete",
               httpStatus: 200,
-              finalUrl,
+              finalUrl: landedUrl,
               html: capped.html,
               axe: { status: "ran", violationCount },
               elapsedMs: elapsed(),
@@ -579,7 +584,7 @@ export async function scanHomePage(
                 return {
                   ...stopped,
                   httpStatus,
-                  finalUrl,
+                  finalUrl: landedUrl,
                   html: capped.html,
                 };
               }
@@ -589,7 +594,7 @@ export async function scanHomePage(
             return {
               outcome: "complete",
               httpStatus: 200,
-              finalUrl,
+              finalUrl: landedUrl,
               html: capped.html,
               axe: { status: "skipped", skipReason },
               elapsedMs: elapsed(),
@@ -605,7 +610,7 @@ export async function scanHomePage(
           reason: "FIRST_RESULTS_BUDGET",
           stage: error.stage,
           httpStatus,
-          finalUrl,
+          finalUrl: reportedUrl,
           detail: redactProviderSecrets(errorText(error)),
           elapsedMs: elapsed(),
         });

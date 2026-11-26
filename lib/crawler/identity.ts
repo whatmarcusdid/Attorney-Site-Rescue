@@ -4,8 +4,8 @@ import { CRAWLER_INFO_URL, SUPPORT_EMAIL } from "../identity";
  * Crawler identity.
  *
  * Outbound page loads should send this User-Agent: a product token, a page
- * that explains the crawler, and an address a site owner can use. The token,
- * URL, and mailbox are placeholders until the crawler inbox decision.
+ * that explains the crawler, and an address a site owner can use. The token
+ * and the info URL are placeholders. The mailbox is the product inbox.
  */
 export const CRAWLER_USER_AGENT = `AttorneySiteRescueBot/0.1-placeholder (+${CRAWLER_INFO_URL}; ${SUPPORT_EMAIL})`;
 

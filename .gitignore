@@ -35,6 +35,10 @@ yarn-error.log*
 # vercel
 .vercel
 
+# local workflow runtime and the routes withWorkflow generates on build
+.workflow-data/
+/app/.well-known/workflow/
+
 # typescript
 *.tsbuildinfo
 
