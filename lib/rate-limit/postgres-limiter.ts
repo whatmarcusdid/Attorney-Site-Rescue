@@ -98,50 +98,40 @@ export async function checkRateLimit(
 /**
  * Check IP-based rate limit (20 audits per hour).
  *
- * Uses rolling window: counts events in the last hour.
+ * Uses atomic Postgres function (from migration 20261126000003).
+ * Advisory lock ensures concurrent requests don't both pass.
  */
 async function checkIpLimit(
   supabase: ReturnType<typeof createAdminClient>,
   clientIp: string,
 ): Promise<RateLimitResult> {
   const limiterKey = `ip:${clientIp}`;
-  const windowStart = new Date(Date.now() - RATE_LIMITS.ip.windowMs);
 
-  // Count events in the rolling window
-  const { error, count } = await supabase
-    .from("rate_limit_events")
-    .select("event_id", { count: "exact", head: true })
-    .eq("limiter_key", limiterKey)
-    .gte("event_time", windowStart.toISOString());
+  const { data, error } = await supabase.rpc("check_and_record_rate_limit", {
+    p_limiter_key: limiterKey,
+    p_limit_type: "ip_hourly",
+    p_limit: RATE_LIMITS.ip.limit,
+    p_window_ms: RATE_LIMITS.ip.windowMs,
+    p_client_ip: clientIp,
+  });
 
   if (error) {
     console.error("[rate-limit] IP limit check failed:", error);
     throw error;
   }
 
-  const eventCount = count ?? 0;
+  const result = data as {
+    allowed: boolean;
+    reason: string | null;
+    count: number;
+    limit: number;
+  };
 
-  if (eventCount >= RATE_LIMITS.ip.limit) {
+  if (!result.allowed) {
     console.warn(
-      `[rate-limit] IP limit exceeded: ${clientIp} (${eventCount}/${RATE_LIMITS.ip.limit})`,
+      `[rate-limit] IP limit exceeded: ${clientIp} (${result.count}/${result.limit})`,
     );
     return { allowed: false, reason: "ip_limited" };
-  }
-
-  // Log event (do not link to audit yet; audit_id is set by caller after audit creation)
-  const expiresAt = new Date(Date.now() + RATE_LIMITS.ip.windowMs);
-  const { error: insertError } = await supabase
-    .from("rate_limit_events")
-    .insert({
-      limiter_key: limiterKey,
-      limit_type: "ip_hourly",
-      client_ip: clientIp,
-      expires_at: expiresAt.toISOString(),
-    });
-
-  if (insertError) {
-    console.error("[rate-limit] IP event insert failed:", insertError);
-    throw insertError;
   }
 
   return { allowed: true, reason: null };
@@ -151,50 +141,40 @@ async function checkIpLimit(
  * Check email-based rate limit (1 audit per 24 hours).
  *
  * Decision 3: Per email, regardless of site.
- * Uses rolling window: counts events in the last 24 hours.
+ * Uses atomic Postgres function (from migration 20261126000003).
+ * Advisory lock ensures concurrent requests don't both pass.
  */
 async function checkEmailLimit(
   supabase: ReturnType<typeof createAdminClient>,
   email: string,
 ): Promise<RateLimitResult> {
   const limiterKey = `email:${email}`;
-  const windowStart = new Date(Date.now() - RATE_LIMITS.email.windowMs);
 
-  // Count events in the rolling window
-  const { error, count } = await supabase
-    .from("rate_limit_events")
-    .select("event_id", { count: "exact", head: true })
-    .eq("limiter_key", limiterKey)
-    .gte("event_time", windowStart.toISOString());
+  const { data, error } = await supabase.rpc("check_and_record_rate_limit", {
+    p_limiter_key: limiterKey,
+    p_limit_type: "email_daily",
+    p_limit: RATE_LIMITS.email.limit,
+    p_window_ms: RATE_LIMITS.email.windowMs,
+    p_email: email,
+  });
 
   if (error) {
     console.error("[rate-limit] Email limit check failed:", error);
     throw error;
   }
 
-  const eventCount = count ?? 0;
+  const result = data as {
+    allowed: boolean;
+    reason: string | null;
+    count: number;
+    limit: number;
+  };
 
-  if (eventCount >= RATE_LIMITS.email.limit) {
+  if (!result.allowed) {
     console.warn(
-      `[rate-limit] Email limit exceeded: ${email} (${eventCount}/${RATE_LIMITS.email.limit})`,
+      `[rate-limit] Email limit exceeded: ${email} (${result.count}/${result.limit})`,
     );
     return { allowed: false, reason: "email_limited" };
-  }
-
-  // Log event
-  const expiresAt = new Date(Date.now() + RATE_LIMITS.email.windowMs);
-  const { error: insertError } = await supabase
-    .from("rate_limit_events")
-    .insert({
-      limiter_key: limiterKey,
-      limit_type: "email_daily",
-      email: email,
-      expires_at: expiresAt.toISOString(),
-    });
-
-  if (insertError) {
-    console.error("[rate-limit] Email event insert failed:", insertError);
-    throw insertError;
   }
 
   return { allowed: true, reason: null };
