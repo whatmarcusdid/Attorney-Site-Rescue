@@ -5,6 +5,8 @@ import * as puppeteerModule from "puppeteer-core";
 import { CRAWLER_USER_AGENT } from "../crawler/identity";
 import {
   assessUrlSafety,
+  checkNavigationUrl,
+  customerMessageFor,
   type LookupAddresses,
   type ProbeRedirects,
   type UrlSafetyReasonCode,
@@ -21,10 +23,13 @@ import {
  * Home-page Browserless client for first results.
  *
  * One puppeteer-core WebSocket session: connect, goto the home page, optional
- * inline axe, then close. After goto, the final URL is checked again before
- * HTML or axe. HTML and axe are raced against the time left in
- * firstResultsBudgetMs. The Browserless session timeout stays the provider
- * kill switch. Limits live on URL_SAFETY_BOUNDS and come from
+ * inline axe, then close. Connect, new page, user-agent, request
+ * interception, and goto each stop at the time left in firstResultsBudgetMs,
+ * and a timeout of 0 is never handed to Puppeteer. After goto, the final URL
+ * is checked again before HTML or axe.
+ * HTML and axe are raced against the time left in that same budget. The
+ * Browserless session timeout stays the provider kill switch. Limits live on
+ * URL_SAFETY_BOUNDS and come from
  * Public audit A1:
  * https://app.notion.com/p/4217eae312ee81b6904cc6dd84852057
  *
@@ -301,32 +306,75 @@ async function raceFirstResultsBudget<T>(
   }
 }
 
-async function connectWithTimeout(endpoint: string): Promise<Browser> {
-  const connect = resolveConnect();
+function closeQuietly(value: { close?: () => unknown } | undefined): void {
+  if (!value || typeof value.close !== "function") return;
+  void Promise.resolve(value.close()).catch(() => undefined);
+}
+
+/**
+ * Wait up to budgetMs. budgetMs must be positive: a 0 timeout is not a
+ * timeout. If the work resolves after the cap fired, close it immediately
+ * and do not return it.
+ */
+async function raceWithCap<T extends { close?: () => unknown }>(
+  work: Promise<T>,
+  budgetMs: number,
+  timeoutError: () => Error,
+): Promise<T> {
+  if (budgetMs <= 0) {
+    return Promise.reject(timeoutError());
+  }
   let timedOut = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
-      connect({ browserWSEndpoint: endpoint }).then((browser) => {
-        if (timedOut) {
-          void browser.close().catch(() => undefined);
-        }
-        return browser;
-      }),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          timedOut = true;
-          reject(
-            Object.assign(new Error("Browserless connect timed out"), {
-              name: "ConnectTimeoutError",
-            }),
-          );
-        }, URL_SAFETY_BOUNDS.connectTimeoutMs);
-      }),
-    ]);
+    return await new Promise<T>((resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        reject(timeoutError());
+      }, budgetMs);
+      work.then(
+        (value) => {
+          if (timedOut) {
+            closeQuietly(value);
+            return;
+          }
+          resolve(value);
+        },
+        (error: unknown) => {
+          if (!timedOut) reject(error);
+        },
+      );
+    });
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+async function awaitWithinBudget(
+  work: Promise<unknown>,
+  budgetMs: number,
+  timeoutError: () => Error,
+): Promise<void> {
+  await raceWithCap(
+    work.then(() => ({})),
+    budgetMs,
+    timeoutError,
+  );
+}
+
+async function connectWithTimeout(
+  endpoint: string,
+  budgetMs: number,
+): Promise<Browser> {
+  const connect = resolveConnect();
+  const hitDeadline = budgetMs < URL_SAFETY_BOUNDS.connectTimeoutMs;
+  return raceWithCap(connect({ browserWSEndpoint: endpoint }), budgetMs, () =>
+    hitDeadline
+      ? firstResultsBudgetError("connect")
+      : Object.assign(new Error("Browserless connect timed out"), {
+          name: "ConnectTimeoutError",
+        }),
+  );
 }
 
 async function runAxe(
@@ -359,6 +407,65 @@ async function runAxe(
   }, URL_SAFETY_BOUNDS.axeTimeoutMs);
 }
 
+type InterceptedRequest = {
+  url: () => string;
+  isNavigationRequest: () => boolean;
+  frame: () => unknown;
+  redirectChain: () => readonly unknown[];
+  abort: (errorCode?: string) => unknown;
+  continue: () => unknown;
+};
+
+function settle(result: unknown): void {
+  void Promise.resolve(result).catch(() => undefined);
+}
+
+/**
+ * Main-frame navigations only. Subresources and other frames are continued.
+ * A failed synchronous check or a redirect chain past the bound aborts the
+ * navigation and records a result. DNS is not repeated here.
+ */
+function handleMainFrameNavigation(
+  request: InterceptedRequest,
+  page: { mainFrame: () => unknown },
+  elapsed: () => number,
+  stop: (result: HomeScanResult) => void,
+): void {
+  const frame = request.frame();
+  const mainFrameNavigation =
+    request.isNavigationRequest() && frame !== null && frame === page.mainFrame();
+  if (!mainFrameNavigation) {
+    settle(request.continue());
+    return;
+  }
+
+  if (request.redirectChain().length > URL_SAFETY_BOUNDS.maxRedirects) {
+    stop(
+      partialResult({
+        reason: "TOO_MANY_REDIRECTS",
+        stage: "goto",
+        elapsedMs: elapsed(),
+      }),
+    );
+    settle(request.abort("blockedbyclient"));
+    return;
+  }
+
+  const checked = checkNavigationUrl(request.url());
+  if (!checked.ok) {
+    stop({
+      outcome: "rejected",
+      reason: checked.reasonCode,
+      stage: "url_safety",
+      customerMessage: customerMessageFor(checked.reasonCode),
+    });
+    settle(request.abort("blockedbyclient"));
+    return;
+  }
+
+  settle(request.continue());
+}
+
 export async function scanHomePage(
   input: string,
   options: ScanHomePageOptions = {},
@@ -367,12 +474,17 @@ export async function scanHomePage(
   const started = now();
   const elapsed = () => Math.max(0, now() - started);
 
+  const safetyDeadline = started + URL_SAFETY_BOUNDS.firstResultsBudgetMs;
+  const safetyDeps = {
+    lookup: options.lookup,
+    probe: options.probe,
+    deadline: safetyDeadline,
+    now,
+  };
+
   let safety;
   try {
-    safety = await assessUrlSafety(input, {
-      lookup: options.lookup,
-      probe: options.probe,
-    });
+    safety = await assessUrlSafety(input, safetyDeps);
   } catch (error) {
     return partialResult({
       reason: "PROVIDER_ERROR",
@@ -414,17 +526,82 @@ export async function scanHomePage(
   const endpoint = websocketEndpoint(host, apiKey);
   let browser: Browser | undefined;
   let stage: Exclude<HomeScanStage, "config"> = "connect";
+  const msLeft = () => Math.floor(safetyDeadline - now());
+  const budgetExhausted = (
+    exhaustedStage: Exclude<HomeScanStage, "config">,
+  ): HomeScanResult =>
+    partialResult({
+      reason: "FIRST_RESULTS_BUDGET",
+      stage: exhaustedStage,
+      detail: redactProviderSecrets("First-results budget exhausted"),
+      elapsedMs: elapsed(),
+    });
+
+  const connectBudget = Math.min(
+    URL_SAFETY_BOUNDS.connectTimeoutMs,
+    msLeft(),
+  );
+  if (connectBudget <= 0) {
+    return budgetExhausted("connect");
+  }
 
   try {
-    browser = await connectWithTimeout(endpoint);
-    const page = await browser.newPage();
-    await page.setUserAgent(CRAWLER_USER_AGENT);
+    browser = await connectWithTimeout(endpoint, connectBudget);
+    const pageBudget = msLeft();
+    if (pageBudget <= 0) {
+      return budgetExhausted("connect");
+    }
+    const page = await raceWithCap(browser.newPage(), pageBudget, () =>
+      firstResultsBudgetError("connect"),
+    );
+    const userAgentBudget = msLeft();
+    if (userAgentBudget <= 0) {
+      return budgetExhausted("connect");
+    }
+    await awaitWithinBudget(
+      page.setUserAgent(CRAWLER_USER_AGENT),
+      userAgentBudget,
+      () => firstResultsBudgetError("connect"),
+    );
 
     stage = "goto";
-    const response = await page.goto(safety.finalUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: URL_SAFETY_BOUNDS.gotoHardTimeoutMs,
+    let navigationStop: HomeScanResult | undefined;
+    const interceptionBudget = msLeft();
+    if (interceptionBudget <= 0) {
+      return budgetExhausted("goto");
+    }
+    await awaitWithinBudget(
+      page.setRequestInterception(true),
+      interceptionBudget,
+      () => firstResultsBudgetError("goto"),
+    );
+    page.on("request", (request) => {
+      handleMainFrameNavigation(
+        request as InterceptedRequest,
+        page,
+        elapsed,
+        (result) => {
+          navigationStop = result;
+        },
+      );
     });
+
+    const gotoBudget = Math.min(URL_SAFETY_BOUNDS.gotoHardTimeoutMs, msLeft());
+    if (gotoBudget <= 0) {
+      return budgetExhausted("goto");
+    }
+
+    let response;
+    try {
+      response = await page.goto(safety.finalUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: gotoBudget,
+      });
+    } catch (error) {
+      if (navigationStop) return navigationStop;
+      throw error;
+    }
+    if (navigationStop) return navigationStop;
 
     if (!response) {
       return partialResult({
@@ -506,7 +683,8 @@ export async function scanHomePage(
           }
           for (const candidate of landedUrls) {
             const landed = await assessUrlSafety(candidate, {
-              lookup: options.lookup,
+              ...safetyDeps,
+              skipRedirectProbe: true,
             });
             if (!landed.ok) {
               return {

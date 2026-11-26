@@ -89,6 +89,19 @@ describe("prohibited-content pre-flight (decision #11 rule 9)", () => {
 
 describe("prohibited content runs inside the URL-safety guard", () => {
   const lookup = async () => ["93.184.216.34"];
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    global.fetch = jest.fn(async () => ({
+      status: 200,
+      headers: { get: () => null },
+      body: { cancel: async () => undefined },
+    })) as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
 
   it("rejects a prohibited submitted URL before any fetch", async () => {
     const result = await assessUrlSafety("https://luckycasino.net", { lookup });

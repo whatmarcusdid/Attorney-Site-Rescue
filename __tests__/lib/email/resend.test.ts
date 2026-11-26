@@ -1,6 +1,8 @@
 /**
  * @jest-environment node
  */
+jest.mock("server-only", () => ({}));
+
 import { createHmac } from "crypto";
 import { DEFAULT_FROM_EMAIL, PRODUCT_NAME, SUPPORT_EMAIL } from "@/lib/identity";
 import { ResendNotConfiguredError } from "@/lib/email/provider";

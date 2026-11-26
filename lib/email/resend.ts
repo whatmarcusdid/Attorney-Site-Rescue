@@ -1,3 +1,4 @@
+import "server-only";
 import { DEFAULT_FROM_EMAIL, PRODUCT_NAME, SUPPORT_EMAIL } from "../identity";
 import {
   ResendNotConfiguredError,

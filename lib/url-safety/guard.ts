@@ -1,5 +1,6 @@
 import { promises as dns } from "node:dns";
 import { isIP } from "node:net";
+import { CRAWLER_USER_AGENT } from "../crawler/identity";
 import { URL_SAFETY_BOUNDS, type UrlSafetyBounds } from "./bounds";
 import {
   hostnameIsIpLiteral,
@@ -34,6 +35,17 @@ export interface UrlSafetyDeps {
   lookup?: LookupAddresses;
   probe?: ProbeRedirects;
   bounds?: Partial<UrlSafetyBounds>;
+  /**
+   * Absolute time in ms. Probe hops and DNS lookups stop when `now()`
+   * reaches it. Omit it and each hop uses only connectTimeoutMs.
+   */
+  deadline?: number;
+  now?: () => number;
+  /**
+   * Validate the URL, including DNS and IP checks, and do not send a
+   * redirect probe. Used after a page has already loaded.
+   */
+  skipRedirectProbe?: boolean;
 }
 
 export type UrlSafetyResult =
@@ -88,17 +100,120 @@ export function defaultLookupAddresses(hostname: string): Promise<string[]> {
     return Promise.resolve([hostname]);
   }
 
-  if (process.env.JEST_WORKER_ID) {
-    return Promise.resolve(["93.184.216.34"]);
-  }
-
   return dns
     .lookup(hostname, { all: true, verbatim: true })
     .then((records) => records.map((record) => record.address));
 }
 
-function defaultProbe(): Promise<RedirectProbeResult> {
-  return Promise.resolve({ status: 200 });
+interface ProbeHttpResponse {
+  status: number;
+  headers: { get(name: string): string | null };
+  body: { cancel(): Promise<void> } | null;
+}
+
+class SiteTimeoutError extends Error {
+  constructor() {
+    super("site timed out");
+    this.name = "SiteTimeoutError";
+  }
+}
+
+function isTimeoutFailure(error: unknown): boolean {
+  if (error instanceof SiteTimeoutError) return true;
+  if (typeof error === "object" && error !== null && "name" in error) {
+    const name = (error as { name?: unknown }).name;
+    return (
+      name === "TimeoutError" ||
+      name === "AbortError" ||
+      name === "SiteTimeoutError"
+    );
+  }
+  return false;
+}
+
+function withDeadline<T>(work: Promise<T>, budgetMs: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (settle: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      settle();
+    };
+    const timer = setTimeout(() => {
+      finish(() => reject(new SiteTimeoutError()));
+    }, budgetMs);
+    work.then(
+      (value) => finish(() => resolve(value)),
+      (error: unknown) => finish(() => reject(error)),
+    );
+  });
+}
+
+async function probeOnce(
+  url: string,
+  method: "HEAD" | "GET",
+  signal: AbortSignal,
+): Promise<RedirectProbeResult> {
+  const response = (await fetch(url, {
+    method,
+    redirect: "manual",
+    signal,
+    headers: {
+      "User-Agent": CRAWLER_USER_AGENT,
+    },
+  })) as ProbeHttpResponse;
+  const location = response.headers.get("location") ?? undefined;
+  if (response.body) {
+    await response.body.cancel().catch(() => undefined);
+  }
+  return {
+    status: response.status,
+    ...(location ? { location } : {}),
+  };
+}
+
+/**
+ * One hop. HEAD first, then GET only when the server rejects HEAD.
+ * The connect bound covers both attempts together. The body is not read.
+ * Network errors and timeouts throw so the guard loop can fail closed.
+ * A timeout is SiteTimeoutError. A refused connection stays a network error.
+ */
+async function defaultProbe(
+  url: string,
+  budgetMs: number,
+): Promise<RedirectProbeResult> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    timer = setTimeout(() => controller.abort(), budgetMs);
+    const head = await probeOnce(url, "HEAD", controller.signal);
+    if (head.status === 405 || head.status === 501) {
+      return await probeOnce(url, "GET", controller.signal);
+    }
+    return head;
+  } catch (error) {
+    if (controller.signal.aborted || isTimeoutFailure(error)) {
+      throw new SiteTimeoutError();
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Synchronous navigation check. Scheme, port, credentials, blocked hostname,
+ * IP-literal address, and prohibited content. DNS is intentionally not done
+ * here; the pre-flight lookup is not pinned to the later browser connection.
+ */
+export function checkNavigationUrl(
+  input: string,
+  bounds: UrlSafetyBounds = URL_SAFETY_BOUNDS,
+): { ok: true } | { ok: false; reasonCode: UrlSafetyReasonCode } {
+  const parsed = parseCandidate(input, bounds);
+  if (!parsed.ok) return { ok: false, reasonCode: parsed.reasonCode };
+  return { ok: true };
 }
 
 function parseCandidate(
@@ -185,7 +300,10 @@ async function validateResolvedAddresses(
   let addresses: string[];
   try {
     addresses = await lookup(host);
-  } catch {
+  } catch (error) {
+    if (isTimeoutFailure(error)) {
+      return { ok: false, reasonCode: "SITE_TIMEOUT" };
+    }
     return { ok: false, reasonCode: "DNS_FAILED" };
   }
 
@@ -237,22 +355,62 @@ export async function assessUrlSafety(
 ): Promise<UrlSafetyResult> {
   const bounds = mergeBounds(deps.bounds);
   const lookup = deps.lookup ?? defaultLookupAddresses;
-  const probe = deps.probe ?? defaultProbe;
+  const injectedProbe = deps.probe;
+  const clock = deps.now ?? Date.now;
+  const hopLimit = (): number => {
+    if (deps.deadline === undefined) return bounds.connectTimeoutMs;
+    return Math.min(
+      bounds.connectTimeoutMs,
+      Math.max(0, deps.deadline - clock()),
+    );
+  };
+  const deadlinePassed = (): boolean =>
+    deps.deadline !== undefined && clock() >= deps.deadline;
+  const limitedLookup: LookupAddresses = async (hostname) => {
+    if (deadlinePassed() || hopLimit() <= 0) {
+      throw new SiteTimeoutError();
+    }
+    return withDeadline(lookup(hostname), hopLimit());
+  };
 
-  const initial = await validateUrlTarget(input, lookup, bounds);
+  if (deadlinePassed()) {
+    return fail("SITE_TIMEOUT", bounds);
+  }
+
+  const initial = await validateUrlTarget(input, limitedLookup, bounds);
   if (!initial.ok) {
     return fail(initial.reasonCode, bounds, initial.prohibited);
+  }
+
+  if (deps.skipRedirectProbe) {
+    return {
+      ok: true,
+      normalizedUrl: initial.normalizedUrl,
+      finalUrl: initial.url.href,
+      resolvedAddresses: initial.addresses,
+      bounds,
+    };
   }
 
   let current = initial.url.href;
   const resolvedAddresses = [...initial.addresses];
 
   for (let hop = 0; hop <= bounds.maxRedirects; hop += 1) {
+    if (deadlinePassed() || hopLimit() <= 0) {
+      return fail("SITE_TIMEOUT", bounds);
+    }
+    const budget = hopLimit();
     let probeResult: RedirectProbeResult;
     try {
-      probeResult = await probe(current);
-    } catch {
-      return fail("DNS_FAILED", bounds);
+      const work = injectedProbe
+        ? injectedProbe(current)
+        : defaultProbe(current, budget);
+      probeResult = await withDeadline(work, budget);
+    } catch (error) {
+      return fail(
+        isTimeoutFailure(error) ? "SITE_TIMEOUT" : "DNS_FAILED",
+        bounds,
+      );
     }
 
     const redirected =
@@ -281,7 +439,7 @@ export async function assessUrlSafety(
       return fail("REDIRECT_BLOCKED", bounds);
     }
 
-    const next = await validateUrlTarget(nextUrl, lookup, bounds);
+    const next = await validateUrlTarget(nextUrl, limitedLookup, bounds);
     if (!next.ok) {
       return fail(
         next.reasonCode === "INVALID_URL" ? "REDIRECT_BLOCKED" : next.reasonCode,

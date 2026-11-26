@@ -1,6 +1,12 @@
 /**
  * @jest-environment node
  */
+jest.mock("node:dns", () => ({
+  promises: {
+    lookup: jest.fn(async () => [{ address: "93.184.216.34", family: 4 }]),
+  },
+}));
+
 jest.mock("puppeteer-core", () => {
   const connect = jest.fn();
   return {
@@ -63,24 +69,69 @@ function mockSession(options?: {
       }),
     });
   const close = jest.fn().mockResolvedValue(undefined);
-  const page = { setUserAgent, goto, content, addScriptTag, evaluate, url };
+  const mainFrame = {};
+  const requestHandlers: Array<(request: InterceptedRequest) => void> = [];
+  const setRequestInterception = jest.fn().mockResolvedValue(undefined);
+  const on = jest.fn((event: string, handler: (request: InterceptedRequest) => void) => {
+    if (event === "request") requestHandlers.push(handler);
+  });
+  const page = {
+    setUserAgent,
+    goto,
+    content,
+    addScriptTag,
+    evaluate,
+    url,
+    setRequestInterception,
+    on,
+    mainFrame: () => mainFrame,
+  };
   const browser = {
     newPage: jest.fn().mockResolvedValue(page),
     close,
   };
   connectMock().mockResolvedValue(browser);
-  return { browser, page, close, goto, evaluate, addScriptTag, setUserAgent, content };
+  return {
+    browser,
+    page,
+    close,
+    goto,
+    evaluate,
+    addScriptTag,
+    setUserAgent,
+    content,
+    mainFrame,
+    requestHandlers,
+    setRequestInterception,
+  };
 }
 
+type InterceptedRequest = {
+  url: () => string;
+  isNavigationRequest: () => boolean;
+  frame: () => unknown;
+  redirectChain: () => readonly unknown[];
+  abort: jest.Mock;
+  continue: jest.Mock;
+};
+
 describe("scanHomePage", () => {
+  const originalFetch = global.fetch;
+
   beforeEach(() => {
     connectMock().mockReset();
     delete process.env.BROWSERLESS_API_KEY;
     delete process.env.BROWSERLESS_HOST;
+    global.fetch = jest.fn(async () => ({
+      status: 200,
+      headers: { get: () => null },
+      body: { cancel: async () => undefined },
+    })) as unknown as typeof fetch;
   });
 
   afterEach(() => {
     jest.useRealTimers();
+    global.fetch = originalFetch;
   });
 
   it("returns a 200 page and runs axe when budget remains", async () => {
@@ -228,6 +279,215 @@ describe("scanHomePage", () => {
     expect(lateClose).toHaveBeenCalled();
   });
 
+  it("returns FIRST_RESULTS_BUDGET and never calls goto with a non-positive timeout", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    let clock = 0;
+    const session = mockSession({
+      goto: jest.fn(async (_url: string, options?: { timeout?: number }) => {
+        const timeout = options?.timeout ?? 0;
+        const waitMs = timeout > 0 ? timeout : 30_000;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        return {
+          status: () => 200,
+          url: () => "https://example.com/",
+          request: () => ({ redirectChain: () => [] }),
+        };
+      }),
+    });
+    session.setUserAgent.mockImplementation(async () => {
+      clock = URL_SAFETY_BOUNDS.firstResultsBudgetMs;
+    });
+
+    const result = await scanHomePage("https://example.com", {
+      now: () => clock,
+    });
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+      stage: "goto",
+    });
+    if (result.outcome === "partial") {
+      expect(result.elapsedMs).toBeLessThanOrEqual(
+        URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      );
+    }
+    expect(session.goto).not.toHaveBeenCalled();
+    for (const call of session.goto.mock.calls) {
+      const timeout = (call[1] as { timeout?: number } | undefined)?.timeout;
+      expect(timeout).toBeGreaterThan(0);
+    }
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it("cuts off a slow connect at the time left and closes it if it resolves late", async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const lateClose = jest.fn().mockResolvedValue(undefined);
+    connectMock().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            resolve({
+              newPage: jest.fn(),
+              close: lateClose,
+            });
+          }, 30_000);
+        }),
+    );
+
+    const pending = scanHomePage("https://example.com", {
+      now: () => Date.now(),
+      lookup: async () => ["93.184.216.34"],
+      probe: async () => {
+        jest.setSystemTime(URL_SAFETY_BOUNDS.firstResultsBudgetMs - 400);
+        return { status: 200 };
+      },
+    });
+    await jest.advanceTimersByTimeAsync(400);
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+      stage: "connect",
+    });
+    if (result.outcome === "partial") {
+      expect(result.elapsedMs).toBeLessThanOrEqual(
+        URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      );
+    }
+    expect(Date.now()).toBeLessThanOrEqual(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    expect(lateClose).not.toHaveBeenCalled();
+
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(lateClose).toHaveBeenCalled();
+  });
+
+  it("cuts off a slow newPage at the time left and closes a late page", async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const pageClose = jest.fn().mockResolvedValue(undefined);
+    const browserClose = jest.fn().mockResolvedValue(undefined);
+    connectMock().mockResolvedValue({
+      newPage: () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            resolve({
+              close: pageClose,
+              setUserAgent: jest.fn().mockResolvedValue(undefined),
+              goto: jest.fn(),
+              setRequestInterception: jest.fn().mockResolvedValue(undefined),
+              on: jest.fn(),
+              mainFrame: () => ({}),
+            });
+          }, 30_000);
+        }),
+      close: browserClose,
+    });
+
+    const pending = scanHomePage("https://example.com", {
+      now: () => Date.now(),
+      lookup: async () => ["93.184.216.34"],
+      probe: async () => {
+        jest.setSystemTime(URL_SAFETY_BOUNDS.firstResultsBudgetMs - 400);
+        return { status: 200 };
+      },
+    });
+    await jest.advanceTimersByTimeAsync(400);
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+      stage: "connect",
+    });
+    if (result.outcome === "partial") {
+      expect(result.elapsedMs).toBeLessThanOrEqual(
+        URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      );
+    }
+    expect(Date.now()).toBeLessThanOrEqual(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    expect(browserClose).toHaveBeenCalled();
+    expect(pageClose).not.toHaveBeenCalled();
+
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(pageClose).toHaveBeenCalled();
+  });
+
+  it("gives goto a positive timeout no greater than one second when that is all that is left", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    let clock = 0;
+    const session = mockSession();
+    session.setUserAgent.mockImplementation(async () => {
+      clock = URL_SAFETY_BOUNDS.firstResultsBudgetMs - 1_000;
+    });
+
+    await scanHomePage("https://example.com", { now: () => clock });
+
+    const timeout = (
+      session.goto.mock.calls[0]?.[1] as { timeout?: number } | undefined
+    )?.timeout;
+    expect(timeout).toBeGreaterThan(0);
+    expect(timeout).toBeLessThanOrEqual(1_000);
+  });
+
+  it("returns FIRST_RESULTS_BUDGET when setUserAgent hangs past the deadline", async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession();
+    session.setUserAgent.mockImplementation(() => new Promise(() => undefined));
+
+    const pending = scanHomePage("https://example.com", {
+      now: () => Date.now(),
+    });
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+    });
+    if (result.outcome === "partial") {
+      expect(result.elapsedMs).toBeLessThanOrEqual(
+        URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      );
+    }
+    expect(Date.now()).toBeLessThanOrEqual(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it("returns FIRST_RESULTS_BUDGET when request interception setup hangs past the deadline", async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession();
+    session.setRequestInterception.mockImplementation(
+      () => new Promise(() => undefined),
+    );
+
+    const pending = scanHomePage("https://example.com", {
+      now: () => Date.now(),
+    });
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+    });
+    if (result.outcome === "partial") {
+      expect(result.elapsedMs).toBeLessThanOrEqual(
+        URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      );
+    }
+    expect(Date.now()).toBeLessThanOrEqual(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    expect(session.close).toHaveBeenCalled();
+  });
+
   it("returns partial for HTTP 404 and does not run axe", async () => {
     process.env.BROWSERLESS_API_KEY = FAKE_KEY;
     const session = mockSession({ status: 404 });
@@ -282,7 +542,7 @@ describe("scanHomePage", () => {
     });
   });
 
-  it("returns partial when the post-goto lookup hangs past the first-results budget", async () => {
+  it("returns SITE_TIMEOUT when the post-goto lookup hangs past the connect bound", async () => {
     jest.useFakeTimers();
     process.env.BROWSERLESS_API_KEY = FAKE_KEY;
     const session = mockSession();
@@ -294,18 +554,143 @@ describe("scanHomePage", () => {
     };
 
     const pending = scanHomePage("https://example.com", { lookup });
-    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.connectTimeoutMs);
     const result = await pending;
 
     expect(result).toMatchObject({
-      outcome: "partial",
-      reason: "FIRST_RESULTS_BUDGET",
+      outcome: "rejected",
+      reason: "SITE_TIMEOUT",
       stage: "url_safety",
+      customerMessage: "This website took too long to respond.",
     });
     expect(result.outcome).not.toBe("complete");
     expect(session.close).toHaveBeenCalled();
     expect(session.addScriptTag).not.toHaveBeenCalled();
     expect(session.content).not.toHaveBeenCalled();
+  });
+
+  it("does not probe a loaded page and still rejects a private landed address", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession({
+      finalUrl: "https://example.com/",
+      pageUrl: "https://internal.example/",
+    });
+    const probed: string[] = [];
+    const probe = jest.fn(async (url: string) => {
+      probed.push(url);
+      return { status: 200 };
+    });
+
+    const result = await scanHomePage("https://example.com", {
+      now: () => 0,
+      probe,
+      lookup: async (hostname) => {
+        if (hostname === "internal.example") return ["10.0.0.5"];
+        return ["93.184.216.34"];
+      },
+    });
+
+    expect(probed).toEqual(["https://example.com/"]);
+    expect(result).toMatchObject({
+      outcome: "rejected",
+      reason: "BLOCKED_ADDRESS",
+      stage: "url_safety",
+    });
+    expect(session.content).not.toHaveBeenCalled();
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it("does not reject a loaded page when a later probe would hang", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    mockSession();
+    let calls = 0;
+    const probe = jest.fn(() => {
+      calls += 1;
+      if (calls > 1) return new Promise<never>(() => undefined);
+      return Promise.resolve({ status: 200 });
+    });
+
+    const result = await scanHomePage("https://example.com", {
+      now: () => 0,
+      probe,
+      lookup: async () => ["93.184.216.34"],
+    });
+
+    expect(calls).toBe(1);
+    expect(result).toMatchObject({
+      outcome: "complete",
+      httpStatus: 200,
+      finalUrl: "https://example.com/",
+    });
+  });
+
+  it("ends by the first-results deadline when hops and the page load are slow", async () => {
+    jest.useFakeTimers();
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    let clock = 0;
+    const now = () => clock;
+    const hopMs = 1900;
+    let hops = 0;
+    let gotoTimeout = -1;
+    const session = mockSession({
+      goto: jest.fn((_url: string, opts?: { timeout?: number }) => {
+        gotoTimeout = opts?.timeout ?? -1;
+        const timeLeftAtGoto =
+          URL_SAFETY_BOUNDS.firstResultsBudgetMs - hopMs * 4;
+        const pageLoadMs =
+          Math.min(URL_SAFETY_BOUNDS.gotoHardTimeoutMs, timeLeftAtGoto) - 1;
+        return new Promise((resolve) => {
+          setTimeout(() => {
+            clock += pageLoadMs;
+            resolve({
+              status: () => 200,
+              url: () => "https://example.com/",
+              request: () => ({ redirectChain: () => [] }),
+            });
+          }, pageLoadMs);
+        });
+      }),
+    });
+    const probe = () =>
+      new Promise<{ status: number; location?: string }>((resolve) => {
+        setTimeout(() => {
+          clock += hopMs;
+          hops += 1;
+          if (hops < 4) {
+            resolve({
+              status: 302,
+              location: `https://example.com/hop${hops}`,
+            });
+          } else {
+            resolve({ status: 200 });
+          }
+        }, hopMs);
+      });
+
+    const pending = scanHomePage("https://example.com", {
+      now,
+      probe,
+      lookup: async () => ["93.184.216.34"],
+    });
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    const result = await pending;
+
+    const timeLeftAtGoto = URL_SAFETY_BOUNDS.firstResultsBudgetMs - hopMs * 4;
+    expect(gotoTimeout).toBe(
+      Math.min(URL_SAFETY_BOUNDS.gotoHardTimeoutMs, timeLeftAtGoto),
+    );
+    expect(clock).toBeLessThanOrEqual(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    expect(clock).toBeGreaterThan(
+      URL_SAFETY_BOUNDS.firstResultsBudgetMs -
+        URL_SAFETY_BOUNDS.axeMinRemainingMs,
+    );
+    expect(result).toMatchObject({
+      outcome: "complete",
+      axe: { status: "skipped", skipReason: "insufficient_budget" },
+    });
+    expect(session.addScriptTag).not.toHaveBeenCalled();
+    expect(session.evaluate).not.toHaveBeenCalled();
+    expect(session.close).toHaveBeenCalled();
   });
 
   it("returns rejected when the post-goto lookup throws", async () => {
@@ -588,5 +973,142 @@ describe("scanHomePage", () => {
     });
     expect(JSON.stringify(result)).not.toContain(FAKE_KEY);
     expect(connectMock()).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "http://127.0.0.1/",
+    "http://169.254.169.254/",
+    "http://[::127.0.0.1]/",
+    "http://[::ffff:127.0.0.1]/",
+    "http://[64:ff9b::7f00:1]/",
+  ])(
+    "rejects a redirect to %s before any Browserless connection",
+    async (location) => {
+      const fetchMock = jest.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const requested = String(input);
+        expect(requested).toBe("https://example.com/");
+        expect(init?.method).toBe("HEAD");
+        expect(init?.redirect).toBe("manual");
+        return {
+          status: 302,
+          headers: {
+            get: (name: string) =>
+              name.toLowerCase() === "location" ? location : null,
+          },
+          body: { cancel: async () => undefined },
+        };
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      const result = await scanHomePage("https://example.com");
+
+      expect(result).toMatchObject({
+        outcome: "rejected",
+        reason: "BLOCKED_ADDRESS",
+        stage: "url_safety",
+      });
+      expect(result.outcome).not.toBe("complete");
+      expect(connectMock()).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("rejects a redirect to a hostname that resolves to a private address", async () => {
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("https://example.com/");
+      return {
+        status: 302,
+        headers: {
+          get: (name: string) =>
+            name.toLowerCase() === "location" ? "https://internal.example/" : null,
+        },
+        body: { cancel: async () => undefined },
+      };
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await scanHomePage("https://example.com", {
+      lookup: async (hostname) =>
+        hostname === "example.com" ? ["93.184.216.34"] : ["10.0.0.5"],
+    });
+
+    expect(result).toMatchObject({
+      outcome: "rejected",
+      reason: "BLOCKED_ADDRESS",
+    });
+    expect(connectMock()).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts a main-frame navigation to a blocked IP literal", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession();
+    const abort = jest.fn();
+    const continued = jest.fn();
+    session.goto.mockImplementation(async () => {
+      const emit = (request: InterceptedRequest) => {
+        for (const handler of session.requestHandlers) handler(request);
+      };
+      emit({
+        url: () => "https://example.com/app.js",
+        isNavigationRequest: () => false,
+        frame: () => session.mainFrame,
+        redirectChain: () => [],
+        abort,
+        continue: continued,
+      });
+      emit({
+        url: () => "http://127.0.0.1/",
+        isNavigationRequest: () => true,
+        frame: () => session.mainFrame,
+        redirectChain: () => [],
+        abort,
+        continue: continued,
+      });
+      throw new Error("net::ERR_BLOCKED_BY_CLIENT");
+    });
+
+    const result = await scanHomePage("https://example.com");
+
+    expect(continued).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledWith("blockedbyclient");
+    expect(result).toMatchObject({
+      outcome: "rejected",
+      reason: "BLOCKED_ADDRESS",
+      stage: "url_safety",
+    });
+    expect(result.outcome).not.toBe("complete");
+  });
+
+  it("aborts a main-frame navigation once the redirect chain exceeds 5", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession();
+    const abort = jest.fn();
+    const continued = jest.fn();
+    session.goto.mockImplementation(async () => {
+      for (const handler of session.requestHandlers) {
+        handler({
+          url: () => "https://example.com/hop",
+          isNavigationRequest: () => true,
+          frame: () => session.mainFrame,
+          redirectChain: () => Array.from({ length: 6 }),
+          abort,
+          continue: continued,
+        });
+      }
+      throw new Error("net::ERR_BLOCKED_BY_CLIENT");
+    });
+
+    const result = await scanHomePage("https://example.com");
+
+    expect(abort).toHaveBeenCalled();
+    expect(continued).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "TOO_MANY_REDIRECTS",
+      stage: "goto",
+    });
+    expect(result.outcome).not.toBe("complete");
   });
 });
