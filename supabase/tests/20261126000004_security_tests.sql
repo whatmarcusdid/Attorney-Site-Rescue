@@ -1,6 +1,6 @@
 -- Security tests for B2 migrations
 -- Tests RLS and function permissions
--- Run after migrations 000001 and 000003
+-- Run after migrations 000001, 000003, and 000005
 --
 -- CRITICAL: These tests MUST fail (exit non-zero) if security is broken.
 -- Uses \set ON_ERROR_STOP on to halt on first error.
@@ -320,10 +320,26 @@ END $$;
 -- =============================================================================
 
 DO $$
+DECLARE
+  v_has_execute BOOLEAN;
 BEGIN
   RAISE NOTICE '';
   RAISE NOTICE '=== TEST 9: anon Cannot EXECUTE Function ===';
   
+  -- Check privilege explicitly (not just attempt to call)
+  SELECT has_function_privilege(
+    'anon',
+    'check_and_record_rate_limit(text,text,integer,integer,inet,text,text)',
+    'EXECUTE'
+  ) INTO v_has_execute;
+  
+  IF v_has_execute THEN
+    RAISE EXCEPTION 'SECURITY FAILURE: anon has EXECUTE privilege on check_and_record_rate_limit';
+  END IF;
+  
+  RAISE NOTICE '✓ anon has no EXECUTE privilege on check_and_record_rate_limit';
+  
+  -- Also verify attempt to call fails
   BEGIN
     SET LOCAL ROLE anon;
     PERFORM check_and_record_rate_limit(
@@ -338,11 +354,11 @@ BEGIN
     RESET ROLE;
     
     -- If we reach here, EXECUTE succeeded (BAD!)
-    RAISE EXCEPTION 'SECURITY FAILURE: anon can EXECUTE check_and_record_rate_limit';
+    RAISE EXCEPTION 'SECURITY FAILURE: anon can EXECUTE check_and_record_rate_limit despite no privilege';
   EXCEPTION
     WHEN insufficient_privilege THEN
       RESET ROLE;
-      RAISE NOTICE '✓ anon blocked from EXECUTE on check_and_record_rate_limit';
+      RAISE NOTICE '✓ anon blocked from calling check_and_record_rate_limit';
   END;
   
   RAISE NOTICE '✓ TEST 9 PASSED: anon cannot EXECUTE function';
@@ -353,10 +369,26 @@ END $$;
 -- =============================================================================
 
 DO $$
+DECLARE
+  v_has_execute BOOLEAN;
 BEGIN
   RAISE NOTICE '';
   RAISE NOTICE '=== TEST 10: authenticated Cannot EXECUTE Function ===';
   
+  -- Check privilege explicitly (not just attempt to call)
+  SELECT has_function_privilege(
+    'authenticated',
+    'check_and_record_rate_limit(text,text,integer,integer,inet,text,text)',
+    'EXECUTE'
+  ) INTO v_has_execute;
+  
+  IF v_has_execute THEN
+    RAISE EXCEPTION 'SECURITY FAILURE: authenticated has EXECUTE privilege on check_and_record_rate_limit';
+  END IF;
+  
+  RAISE NOTICE '✓ authenticated has no EXECUTE privilege on check_and_record_rate_limit';
+  
+  -- Also verify attempt to call fails
   BEGIN
     SET LOCAL ROLE authenticated;
     PERFORM check_and_record_rate_limit(
@@ -371,14 +403,45 @@ BEGIN
     RESET ROLE;
     
     -- If we reach here, EXECUTE succeeded (BAD!)
-    RAISE EXCEPTION 'SECURITY FAILURE: authenticated can EXECUTE check_and_record_rate_limit';
+    RAISE EXCEPTION 'SECURITY FAILURE: authenticated can EXECUTE check_and_record_rate_limit despite no privilege';
   EXCEPTION
     WHEN insufficient_privilege THEN
       RESET ROLE;
-      RAISE NOTICE '✓ authenticated blocked from EXECUTE on check_and_record_rate_limit';
+      RAISE NOTICE '✓ authenticated blocked from calling check_and_record_rate_limit';
   END;
   
   RAISE NOTICE '✓ TEST 10 PASSED: authenticated cannot EXECUTE function';
+END $$;
+
+-- =============================================================================
+-- TEST 10A: PUBLIC (no grants) cannot EXECUTE check_and_record_rate_limit
+-- =============================================================================
+
+DO $$
+DECLARE
+  v_has_execute BOOLEAN;
+BEGIN
+  RAISE NOTICE '';
+  RAISE NOTICE '=== TEST 10A: PUBLIC Cannot EXECUTE Function ===';
+  
+  -- Check if PUBLIC has EXECUTE privilege via a fresh role with no grants
+  -- Create a temporary role to test PUBLIC grants
+  CREATE ROLE temp_test_role NOLOGIN;
+  
+  SELECT has_function_privilege(
+    'temp_test_role',
+    'check_and_record_rate_limit(text,text,integer,integer,inet,text,text)',
+    'EXECUTE'
+  ) INTO v_has_execute;
+  
+  DROP ROLE temp_test_role;
+  
+  IF v_has_execute THEN
+    RAISE EXCEPTION 'SECURITY FAILURE: PUBLIC has EXECUTE privilege on check_and_record_rate_limit';
+  END IF;
+  
+  RAISE NOTICE '✓ PUBLIC has no EXECUTE privilege on check_and_record_rate_limit';
+  RAISE NOTICE '✓ TEST 10A PASSED: PUBLIC cannot EXECUTE function';
 END $$;
 
 -- =============================================================================

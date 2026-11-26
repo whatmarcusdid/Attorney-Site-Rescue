@@ -16,7 +16,16 @@ Migrations in `migrations/` are applied sequentially by Supabase CLI (`supabase 
 **Current migrations:**
 - `20261126000001_create_audit_schema.sql` - Creates all tables with constraints and RLS
 - `20261126000003_atomic_rate_limit.sql` - Atomic rate limit function (secured)
-- `20261126000005_revoke_truncate.sql` - Revoke TRUNCATE from anon/authenticated
+- `20261126000005_revoke_truncate.sql` - Revoke ALL from anon/authenticated
+
+### Prerequisites
+
+**Required roles must exist before running migrations:**
+- `anon` - Supabase public anonymous role
+- `authenticated` - Supabase logged-in users role  
+- `service_role` - Supabase service role (bypasses RLS)
+
+Migrations 000001, 000003, and 000005 grant/revoke permissions conditionally based on role existence. If roles are missing, those operations are skipped (no error, but security may be incomplete).
 
 ### Applying Migrations
 
