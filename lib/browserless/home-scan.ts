@@ -5,6 +5,8 @@ import * as puppeteerModule from "puppeteer-core";
 import { CRAWLER_USER_AGENT } from "../crawler/identity";
 import {
   assessUrlSafety,
+  checkNavigationUrl,
+  customerMessageFor,
   type LookupAddresses,
   type ProbeRedirects,
   type UrlSafetyReasonCode,
@@ -359,6 +361,65 @@ async function runAxe(
   }, URL_SAFETY_BOUNDS.axeTimeoutMs);
 }
 
+type InterceptedRequest = {
+  url: () => string;
+  isNavigationRequest: () => boolean;
+  frame: () => unknown;
+  redirectChain: () => readonly unknown[];
+  abort: (errorCode?: string) => unknown;
+  continue: () => unknown;
+};
+
+function settle(result: unknown): void {
+  void Promise.resolve(result).catch(() => undefined);
+}
+
+/**
+ * Main-frame navigations only. Subresources and other frames are continued.
+ * A failed synchronous check or a redirect chain past the bound aborts the
+ * navigation and records a result. DNS is not repeated here.
+ */
+function handleMainFrameNavigation(
+  request: InterceptedRequest,
+  page: { mainFrame: () => unknown },
+  elapsed: () => number,
+  stop: (result: HomeScanResult) => void,
+): void {
+  const frame = request.frame();
+  const mainFrameNavigation =
+    request.isNavigationRequest() && frame !== null && frame === page.mainFrame();
+  if (!mainFrameNavigation) {
+    settle(request.continue());
+    return;
+  }
+
+  if (request.redirectChain().length > URL_SAFETY_BOUNDS.maxRedirects) {
+    stop(
+      partialResult({
+        reason: "TOO_MANY_REDIRECTS",
+        stage: "goto",
+        elapsedMs: elapsed(),
+      }),
+    );
+    settle(request.abort("blockedbyclient"));
+    return;
+  }
+
+  const checked = checkNavigationUrl(request.url());
+  if (!checked.ok) {
+    stop({
+      outcome: "rejected",
+      reason: checked.reasonCode,
+      stage: "url_safety",
+      customerMessage: customerMessageFor(checked.reasonCode),
+    });
+    settle(request.abort("blockedbyclient"));
+    return;
+  }
+
+  settle(request.continue());
+}
+
 export async function scanHomePage(
   input: string,
   options: ScanHomePageOptions = {},
@@ -421,10 +482,30 @@ export async function scanHomePage(
     await page.setUserAgent(CRAWLER_USER_AGENT);
 
     stage = "goto";
-    const response = await page.goto(safety.finalUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: URL_SAFETY_BOUNDS.gotoHardTimeoutMs,
+    let navigationStop: HomeScanResult | undefined;
+    await page.setRequestInterception(true);
+    page.on("request", (request) => {
+      handleMainFrameNavigation(
+        request as InterceptedRequest,
+        page,
+        elapsed,
+        (result) => {
+          navigationStop = result;
+        },
+      );
     });
+
+    let response;
+    try {
+      response = await page.goto(safety.finalUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: URL_SAFETY_BOUNDS.gotoHardTimeoutMs,
+      });
+    } catch (error) {
+      if (navigationStop) return navigationStop;
+      throw error;
+    }
+    if (navigationStop) return navigationStop;
 
     if (!response) {
       return partialResult({

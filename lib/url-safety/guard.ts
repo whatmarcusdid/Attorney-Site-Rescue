@@ -88,17 +88,72 @@ export function defaultLookupAddresses(hostname: string): Promise<string[]> {
     return Promise.resolve([hostname]);
   }
 
-  if (process.env.JEST_WORKER_ID) {
-    return Promise.resolve(["93.184.216.34"]);
-  }
-
   return dns
     .lookup(hostname, { all: true, verbatim: true })
     .then((records) => records.map((record) => record.address));
 }
 
-function defaultProbe(): Promise<RedirectProbeResult> {
-  return Promise.resolve({ status: 200 });
+interface ProbeHttpResponse {
+  status: number;
+  headers: { get(name: string): string | null };
+  body: { cancel(): Promise<void> } | null;
+}
+
+async function probeOnce(
+  url: string,
+  method: "HEAD" | "GET",
+  signal: AbortSignal,
+): Promise<RedirectProbeResult> {
+  const response = (await fetch(url, {
+    method,
+    redirect: "manual",
+    signal,
+  })) as ProbeHttpResponse;
+  const location = response.headers.get("location") ?? undefined;
+  if (response.body) {
+    await response.body.cancel().catch(() => undefined);
+  }
+  return {
+    status: response.status,
+    ...(location ? { location } : {}),
+  };
+}
+
+/**
+ * One hop. HEAD first, then GET only when the server rejects HEAD.
+ * The connect bound covers both attempts together. The body is not read.
+ * Network errors and timeouts throw so the guard loop can fail closed.
+ */
+async function defaultProbe(url: string): Promise<RedirectProbeResult> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    timer = setTimeout(
+      () => controller.abort(),
+      URL_SAFETY_BOUNDS.connectTimeoutMs,
+    );
+    const head = await probeOnce(url, "HEAD", controller.signal);
+    if (head.status === 405 || head.status === 501) {
+      return await probeOnce(url, "GET", controller.signal);
+    }
+    return head;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Synchronous navigation check. Scheme, port, credentials, blocked hostname,
+ * IP-literal address, and prohibited content. DNS is intentionally not done
+ * here; the pre-flight lookup is not pinned to the later browser connection.
+ */
+export function checkNavigationUrl(
+  input: string,
+  bounds: UrlSafetyBounds = URL_SAFETY_BOUNDS,
+): { ok: true } | { ok: false; reasonCode: UrlSafetyReasonCode } {
+  const parsed = parseCandidate(input, bounds);
+  if (!parsed.ok) return { ok: false, reasonCode: parsed.reasonCode };
+  return { ok: true };
 }
 
 function parseCandidate(

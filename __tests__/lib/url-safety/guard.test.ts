@@ -13,7 +13,29 @@ function lookupOf(addresses: string[]) {
   return async () => addresses;
 }
 
+function probeResponse(status: number, location?: string) {
+  return {
+    status,
+    headers: {
+      get: (name: string) =>
+        name.toLowerCase() === "location" ? (location ?? null) : null,
+    },
+    body: { cancel: async () => undefined },
+  };
+}
+
 describe("assessUrlSafety", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    global.fetch = jest.fn(async () => probeResponse(200)) as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    jest.useRealTimers();
+  });
+
   it("normalizes a bare domain to https and allows a public host", async () => {
     const result = await assessUrlSafety("example.com", {
       lookup: lookupOf([PUBLIC_IP]),
@@ -191,5 +213,107 @@ describe("assessUrlSafety", () => {
       expect(result.customerMessage).not.toContain("10.0.0.9");
       expect(result.customerMessage).not.toContain("ENOTFOUND");
     }
+  });
+
+  it("allows five redirects and rejects a sixth", async () => {
+    let allowedHops = 0;
+    const allowed = await assessUrlSafety("https://example.com/start", {
+      lookup: lookupOf([PUBLIC_IP]),
+      probe: async () => {
+        allowedHops += 1;
+        if (allowedHops <= 5) {
+          return { status: 302, location: `https://example.com/hop${allowedHops}` };
+        }
+        return { status: 200 };
+      },
+    });
+    expect(allowed.ok).toBe(true);
+    if (allowed.ok) {
+      expect(allowed.finalUrl).toBe("https://example.com/hop5");
+    }
+
+    let rejectedHops = 0;
+    const rejected = await assessUrlSafety("https://example.com/start", {
+      lookup: lookupOf([PUBLIC_IP]),
+      probe: async () => {
+        rejectedHops += 1;
+        return {
+          status: 302,
+          location: `https://example.com/hop${rejectedHops}`,
+        };
+      },
+    });
+    expect(rejected).toMatchObject({
+      ok: false,
+      reasonCode: "TOO_MANY_REDIRECTS",
+    });
+  });
+
+  it("probes each hop with HEAD and does not request a blocked redirect target", async () => {
+    const seen: string[] = [];
+    global.fetch = jest.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(String(input));
+      expect(init?.redirect).toBe("manual");
+      expect(init?.method).toBe("HEAD");
+      if (seen.length === 1) return probeResponse(302, "http://169.254.169.254/latest");
+      throw new Error("probed the blocked hop");
+    }) as unknown as typeof fetch;
+
+    const result = await assessUrlSafety("https://example.com/start", {
+      lookup: lookupOf([PUBLIC_IP]),
+    });
+
+    expect(result).toMatchObject({ ok: false, reasonCode: "BLOCKED_ADDRESS" });
+    expect(seen).toEqual(["https://example.com/start"]);
+  });
+
+  it.each([405, 501])(
+    "falls back from HEAD to GET when HEAD returns %s",
+    async (status) => {
+      const methods: string[] = [];
+      global.fetch = jest.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        methods.push(init?.method ?? "");
+        if (init?.method === "HEAD") return probeResponse(status);
+        return probeResponse(200);
+      }) as unknown as typeof fetch;
+
+      const result = await assessUrlSafety("https://example.com", {
+        lookup: lookupOf([PUBLIC_IP]),
+      });
+
+      expect(result.ok).toBe(true);
+      expect(methods).toEqual(["HEAD", "GET"]);
+    },
+  );
+
+  it("returns a safety result when the probe times out", async () => {
+    jest.useFakeTimers();
+    global.fetch = jest.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          reject(Object.assign(new Error("aborted"), { name: "TimeoutError" }));
+        });
+      });
+    }) as unknown as typeof fetch;
+
+    const pending = assessUrlSafety("https://example.com", {
+      lookup: lookupOf([PUBLIC_IP]),
+    });
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.connectTimeoutMs);
+    const result = await pending;
+
+    expect(result).toMatchObject({ ok: false, reasonCode: "DNS_FAILED" });
+  });
+
+  it("returns a safety result when the probe hits a network error", async () => {
+    global.fetch = jest.fn(async () => {
+      throw new TypeError("network down");
+    }) as unknown as typeof fetch;
+
+    const result = await assessUrlSafety("https://example.com", {
+      lookup: lookupOf([PUBLIC_IP]),
+    });
+
+    expect(result).toMatchObject({ ok: false, reasonCode: "DNS_FAILED" });
   });
 });

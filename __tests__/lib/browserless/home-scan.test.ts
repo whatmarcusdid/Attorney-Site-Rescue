@@ -1,6 +1,12 @@
 /**
  * @jest-environment node
  */
+jest.mock("node:dns", () => ({
+  promises: {
+    lookup: jest.fn(async () => [{ address: "93.184.216.34", family: 4 }]),
+  },
+}));
+
 jest.mock("puppeteer-core", () => {
   const connect = jest.fn();
   return {
@@ -63,24 +69,69 @@ function mockSession(options?: {
       }),
     });
   const close = jest.fn().mockResolvedValue(undefined);
-  const page = { setUserAgent, goto, content, addScriptTag, evaluate, url };
+  const mainFrame = {};
+  const requestHandlers: Array<(request: InterceptedRequest) => void> = [];
+  const setRequestInterception = jest.fn().mockResolvedValue(undefined);
+  const on = jest.fn((event: string, handler: (request: InterceptedRequest) => void) => {
+    if (event === "request") requestHandlers.push(handler);
+  });
+  const page = {
+    setUserAgent,
+    goto,
+    content,
+    addScriptTag,
+    evaluate,
+    url,
+    setRequestInterception,
+    on,
+    mainFrame: () => mainFrame,
+  };
   const browser = {
     newPage: jest.fn().mockResolvedValue(page),
     close,
   };
   connectMock().mockResolvedValue(browser);
-  return { browser, page, close, goto, evaluate, addScriptTag, setUserAgent, content };
+  return {
+    browser,
+    page,
+    close,
+    goto,
+    evaluate,
+    addScriptTag,
+    setUserAgent,
+    content,
+    mainFrame,
+    requestHandlers,
+    setRequestInterception,
+  };
 }
 
+type InterceptedRequest = {
+  url: () => string;
+  isNavigationRequest: () => boolean;
+  frame: () => unknown;
+  redirectChain: () => readonly unknown[];
+  abort: jest.Mock;
+  continue: jest.Mock;
+};
+
 describe("scanHomePage", () => {
+  const originalFetch = global.fetch;
+
   beforeEach(() => {
     connectMock().mockReset();
     delete process.env.BROWSERLESS_API_KEY;
     delete process.env.BROWSERLESS_HOST;
+    global.fetch = jest.fn(async () => ({
+      status: 200,
+      headers: { get: () => null },
+      body: { cancel: async () => undefined },
+    })) as unknown as typeof fetch;
   });
 
   afterEach(() => {
     jest.useRealTimers();
+    global.fetch = originalFetch;
   });
 
   it("returns a 200 page and runs axe when budget remains", async () => {
@@ -588,5 +639,142 @@ describe("scanHomePage", () => {
     });
     expect(JSON.stringify(result)).not.toContain(FAKE_KEY);
     expect(connectMock()).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "http://127.0.0.1/",
+    "http://169.254.169.254/",
+    "http://[::127.0.0.1]/",
+    "http://[::ffff:127.0.0.1]/",
+    "http://[64:ff9b::7f00:1]/",
+  ])(
+    "rejects a redirect to %s before any Browserless connection",
+    async (location) => {
+      const fetchMock = jest.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const requested = String(input);
+        expect(requested).toBe("https://example.com/");
+        expect(init?.method).toBe("HEAD");
+        expect(init?.redirect).toBe("manual");
+        return {
+          status: 302,
+          headers: {
+            get: (name: string) =>
+              name.toLowerCase() === "location" ? location : null,
+          },
+          body: { cancel: async () => undefined },
+        };
+      });
+      global.fetch = fetchMock as unknown as typeof fetch;
+
+      const result = await scanHomePage("https://example.com");
+
+      expect(result).toMatchObject({
+        outcome: "rejected",
+        reason: "BLOCKED_ADDRESS",
+        stage: "url_safety",
+      });
+      expect(result.outcome).not.toBe("complete");
+      expect(connectMock()).not.toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("rejects a redirect to a hostname that resolves to a private address", async () => {
+    const fetchMock = jest.fn(async (input: RequestInfo | URL) => {
+      expect(String(input)).toBe("https://example.com/");
+      return {
+        status: 302,
+        headers: {
+          get: (name: string) =>
+            name.toLowerCase() === "location" ? "https://internal.example/" : null,
+        },
+        body: { cancel: async () => undefined },
+      };
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await scanHomePage("https://example.com", {
+      lookup: async (hostname) =>
+        hostname === "example.com" ? ["93.184.216.34"] : ["10.0.0.5"],
+    });
+
+    expect(result).toMatchObject({
+      outcome: "rejected",
+      reason: "BLOCKED_ADDRESS",
+    });
+    expect(connectMock()).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts a main-frame navigation to a blocked IP literal", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession();
+    const abort = jest.fn();
+    const continued = jest.fn();
+    session.goto.mockImplementation(async () => {
+      const emit = (request: InterceptedRequest) => {
+        for (const handler of session.requestHandlers) handler(request);
+      };
+      emit({
+        url: () => "https://example.com/app.js",
+        isNavigationRequest: () => false,
+        frame: () => session.mainFrame,
+        redirectChain: () => [],
+        abort,
+        continue: continued,
+      });
+      emit({
+        url: () => "http://127.0.0.1/",
+        isNavigationRequest: () => true,
+        frame: () => session.mainFrame,
+        redirectChain: () => [],
+        abort,
+        continue: continued,
+      });
+      throw new Error("net::ERR_BLOCKED_BY_CLIENT");
+    });
+
+    const result = await scanHomePage("https://example.com");
+
+    expect(continued).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledWith("blockedbyclient");
+    expect(result).toMatchObject({
+      outcome: "rejected",
+      reason: "BLOCKED_ADDRESS",
+      stage: "url_safety",
+    });
+    expect(result.outcome).not.toBe("complete");
+  });
+
+  it("aborts a main-frame navigation once the redirect chain exceeds 5", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession();
+    const abort = jest.fn();
+    const continued = jest.fn();
+    session.goto.mockImplementation(async () => {
+      for (const handler of session.requestHandlers) {
+        handler({
+          url: () => "https://example.com/hop",
+          isNavigationRequest: () => true,
+          frame: () => session.mainFrame,
+          redirectChain: () => Array.from({ length: 6 }),
+          abort,
+          continue: continued,
+        });
+      }
+      throw new Error("net::ERR_BLOCKED_BY_CLIENT");
+    });
+
+    const result = await scanHomePage("https://example.com");
+
+    expect(abort).toHaveBeenCalled();
+    expect(continued).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "TOO_MANY_REDIRECTS",
+      stage: "goto",
+    });
+    expect(result.outcome).not.toBe("complete");
   });
 });

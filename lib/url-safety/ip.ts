@@ -7,8 +7,12 @@ const IPV4_BLOCKED_CIDRS = [
   "127.0.0.0/8",
   "169.254.0.0/16",
   "172.16.0.0/12",
+  "192.0.0.0/24",
+  "192.0.2.0/24",
   "192.168.0.0/16",
   "198.18.0.0/15",
+  "198.51.100.0/24",
+  "203.0.113.0/24",
   "224.0.0.0/4",
   "240.0.0.0/4",
 ] as const;
@@ -101,24 +105,27 @@ function ipv6PrefixMatch(ip: string, prefix: string, bits: number): boolean {
 }
 
 export function isBlockedIPv6(ip: string): boolean {
-  const mapped = ipv4MappedAddress(ip);
+  const normalized = unwrapHostname(ip);
+  const mapped = ipv4EmbeddedAddress(normalized, BigInt(0xffff));
   if (mapped) return isBlockedIPv4(mapped);
 
+  const compatible = ipv4EmbeddedAddress(normalized, BigInt(0));
+  if (compatible) return isBlockedIPv4(compatible);
+
   return (
-    ipv6PrefixMatch(ip, "::1", 128) ||
-    ipv6PrefixMatch(ip, "::", 128) ||
-    ipv6PrefixMatch(ip, "fe80::", 10) ||
-    ipv6PrefixMatch(ip, "fc00::", 7) ||
-    ipv6PrefixMatch(ip, "ff00::", 8) ||
-    ipv6PrefixMatch(ip, "fec0::", 10)
+    ipv6PrefixMatch(normalized, "::1", 128) ||
+    ipv6PrefixMatch(normalized, "::", 128) ||
+    ipv6PrefixMatch(normalized, "fe80::", 10) ||
+    ipv6PrefixMatch(normalized, "fc00::", 7) ||
+    ipv6PrefixMatch(normalized, "ff00::", 8) ||
+    ipv6PrefixMatch(normalized, "fec0::", 10) ||
+    ipv6PrefixMatch(normalized, "64:ff9b::", 96) ||
+    ipv6PrefixMatch(normalized, "64:ff9b:1::", 48) ||
+    ipv6PrefixMatch(normalized, "2002::", 16)
   );
 }
 
-function ipv4MappedAddress(ip: string): string | null {
-  const value = expandIPv6(ip);
-  if (value === null) return null;
-  const mappedPrefix = BigInt(0xffff);
-  if (value >> BigInt(32) !== mappedPrefix) return null;
+function ipv4FromLow32(value: bigint): string {
   const v4 = Number(value & BigInt(0xffffffff)) >>> 0;
   return [
     (v4 >>> 24) & 255,
@@ -126,6 +133,17 @@ function ipv4MappedAddress(ip: string): string | null {
     (v4 >>> 8) & 255,
     v4 & 255,
   ].join(".");
+}
+
+/**
+ * IPv4-mapped addresses use prefix ::ffff:0:0/96. IPv4-compatible addresses
+ * use prefix ::/96. `prefix` is those high 96 bits after the low 32.
+ */
+function ipv4EmbeddedAddress(ip: string, prefix: bigint): string | null {
+  const value = expandIPv6(ip);
+  if (value === null) return null;
+  if (value >> BigInt(32) !== prefix) return null;
+  return ipv4FromLow32(value);
 }
 
 export function isBlockedIp(address: string): boolean {

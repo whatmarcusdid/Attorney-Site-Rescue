@@ -1,6 +1,7 @@
 export { URL_SAFETY_BOUNDS, type UrlSafetyBounds } from "./bounds";
 export {
   assessUrlSafety,
+  checkNavigationUrl,
   defaultLookupAddresses,
   normalizeSubmittedUrl,
   type LookupAddresses,
