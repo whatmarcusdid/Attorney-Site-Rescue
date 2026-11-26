@@ -14,8 +14,9 @@ supabase/
 Migrations in `migrations/` are applied sequentially by Supabase CLI (`supabase db push`).
 
 **Current migrations:**
-- `20261126000001_create_audit_schema.sql` - Creates all tables with constraints
-- `20261126000003_atomic_rate_limit.sql` - Atomic rate limit function
+- `20261126000001_create_audit_schema.sql` - Creates all tables with constraints and RLS
+- `20261126000003_atomic_rate_limit.sql` - Atomic rate limit function (secured)
+- `20261126000005_revoke_truncate.sql` - Revoke TRUNCATE from anon/authenticated
 
 ### Applying Migrations
 
@@ -23,49 +24,70 @@ Migrations in `migrations/` are applied sequentially by Supabase CLI (`supabase 
 # Local Supabase (requires Supabase CLI)
 supabase db push
 
-# Or apply manually to any Postgres database
+# Or apply manually to any Postgres database (in order)
 psql -d <database> -f supabase/migrations/20261126000001_create_audit_schema.sql
 psql -d <database> -f supabase/migrations/20261126000003_atomic_rate_limit.sql
+psql -d <database> -f supabase/migrations/20261126000005_revoke_truncate.sql
 ```
 
 ## Tests
 
-Tests in `tests/` verify schema constraints but are **not** automatically applied.
+Tests in `tests/` verify schema constraints and security but are **not** automatically applied.
 
-### Running Constraint Tests
+### Running Tests
 
 ```bash
 # Apply migrations first (see above)
+
+# 1. Constraint tests (12 tests)
 psql -d <database> -f supabase/tests/20261126000002_test_constraints.sql
+
+# 2. Security tests (12 tests) - requires anon/authenticated/service_role roles
+psql -d <database> -f supabase/tests/20261126000004_security_tests.sql
 ```
 
-**Expected output:**
+**Expected output (constraint tests):**
 ```
 ✓ TEST 1.1-1.6 PASSED (check_results constraint)
 ✓ TEST 2.1-2.6 PASSED (section_results constraint)
 === ALL CONSTRAINT TESTS COMPLETED SUCCESSFULLY ===
 ```
 
-The test script:
-1. Creates a test audit
-2. Runs 12 constraint tests (6 for each rule)
-3. Cleans up test data
-4. Reports pass/fail for each test
+**Expected output (security tests):**
+```
+✓ TEST 1-12 PASSED
+=== ALL SECURITY TESTS PASSED ===
+```
+
+**Security tests use `\set ON_ERROR_STOP on`:**
+- Script exits non-zero if any security violation is detected
+- Tests SELECT, INSERT, UPDATE, DELETE, TRUNCATE, EXECUTE permissions
+- Verifies RLS is enabled on all 7 tables
 
 ## Rollback
 
 Rollback scripts in `rollback/` are for **manual recovery only**. Use with caution.
 
-### Rolling Back
+### Rolling Back (Reverse Order)
 
 ```bash
 # WARNING: This permanently deletes all audit data
+# Apply rollbacks in REVERSE order of migrations:
+
+# 1. Rollback 000005 (TRUNCATE permissions)
+psql -d <database> -f supabase/rollback/20261126000005_rollback.sql
+
+# 2. Rollback 000003 (rate limit function)
+psql -d <database> -f supabase/rollback/20261126000003_rollback.sql
+
+# 3. Rollback 000001 (all tables)
 psql -d <database> -f supabase/rollback/20261126000001_rollback.sql
 ```
 
 **What it does:**
-- Drops all tables (audits, check_results, section_results, etc.)
-- Drops triggers and functions
+- 000005: Grants TRUNCATE back to anon/authenticated (reverses revocation)
+- 000003: Drops check_and_record_rate_limit function
+- 000001: Drops all 7 tables (audits, check_results, section_results, etc.)
 - Deletes data permanently (not recoverable without backup)
 
 **When to use:**
