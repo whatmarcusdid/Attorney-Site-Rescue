@@ -28,6 +28,18 @@ const describeIfDb = process.env.RUN_INTEGRATION_TESTS ? describe : describe.ski
 describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
   let pool: Pool;
 
+  // Helper function to execute queries as service_role
+  async function queryAsServiceRole(text: string, params?: unknown[]) {
+    const client = await pool.connect();
+    try {
+      await client.query('SET ROLE service_role');
+      await client.query('SET search_path = public');
+      return await client.query(text, params);
+    } finally {
+      client.release();
+    }
+  }
+
   beforeAll(async () => {
     // Pool allows concurrent connections (each query gets its own connection)
     pool = new Pool({
@@ -35,20 +47,42 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       max: 30, // Support up to 30 concurrent requests
     });
 
-    // Verify function exists
-    const { rows } = await pool.query(
-      "SELECT 1 FROM pg_proc WHERE proname = 'check_and_record_rate_limit'",
-    );
-    if (rows.length === 0) {
-      throw new Error(
-        "check_and_record_rate_limit function not found. Apply migrations first.",
+    // Create service_role if it doesn't exist (for throwaway Postgres)
+    await pool.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'service_role') THEN
+          CREATE ROLE service_role NOLOGIN BYPASSRLS;
+        END IF;
+      END $$;
+    `);
+
+    // Grant necessary permissions to service_role
+    await pool.query(`GRANT USAGE ON SCHEMA public TO service_role`);
+    await pool.query(`GRANT ALL ON ALL TABLES IN SCHEMA public TO service_role`);
+    await pool.query(`GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA public TO service_role`);
+
+    // Verify function exists and service_role can call it
+    // Test connection sets role to service_role
+    const client = await pool.connect();
+    try {
+      await client.query('SET ROLE service_role');
+      const { rows } = await client.query(
+        "SELECT 1 FROM pg_proc WHERE proname = 'check_and_record_rate_limit'",
       );
+      if (rows.length === 0) {
+        throw new Error(
+          "check_and_record_rate_limit function not found. Apply migrations first.",
+        );
+      }
+    } finally {
+      client.release();
     }
   });
 
   afterAll(async () => {
     // Cleanup test events
-    await pool.query(
+    await queryAsServiceRole(
       "DELETE FROM rate_limit_events WHERE email LIKE 'test%' OR limiter_key LIKE 'ip:203.0.113.%'",
     );
     await pool.end();
@@ -56,7 +90,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
 
   beforeEach(async () => {
     // Clean up before each test
-    await pool.query(
+    await queryAsServiceRole(
       "DELETE FROM rate_limit_events WHERE email LIKE 'test-%' OR limiter_key LIKE 'ip:203.0.113.%'",
     );
   });
@@ -74,28 +108,28 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
         const testIp = "203.0.113.100";
         const limiterKey = `email:${testEmail}`;
 
-        // Simulate double submit: two requests at exact same time
-        // Pool gives each query its own connection → true concurrency
-        const [result1, result2] = await Promise.all([
-          pool.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
-            limiterKey,
-            "email_daily",
-            1,
-            24 * 60 * 60 * 1000,
-            testIp,
-            testEmail,
-            "test-agent",
-          ]),
-          pool.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
-            limiterKey,
-            "email_daily",
-            1,
-            24 * 60 * 60 * 1000,
-            testIp,
-            testEmail,
-            "test-agent",
-          ]),
-        ]);
+      // Simulate double submit: two requests at exact same time
+      // Pool gives each query its own connection → true concurrency
+      const [result1, result2] = await Promise.all([
+        queryAsServiceRole("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
+          limiterKey,
+          "email_daily",
+          1,
+          24 * 60 * 60 * 1000,
+          testIp,
+          testEmail,
+          "test-agent",
+        ]),
+        queryAsServiceRole("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
+          limiterKey,
+          "email_daily",
+          1,
+          24 * 60 * 60 * 1000,
+          testIp,
+          testEmail,
+          "test-agent",
+        ]),
+      ]);
 
         const data1 = result1.rows[0].check_and_record_rate_limit;
         const data2 = result2.rows[0].check_and_record_rate_limit;
@@ -111,12 +145,12 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
         // Exactly one should be allowed in every round
         expect(allowedCount).toBe(1);
 
-        // Verify only 1 event was recorded
-        const { rows: countRows } = await pool.query(
-          "SELECT COUNT(*) FROM rate_limit_events WHERE email = $1",
-          [testEmail],
-        );
-        expect(parseInt(countRows[0].count)).toBe(1);
+      // Verify only 1 event was recorded
+      const { rows: countRows } = await queryAsServiceRole(
+        "SELECT COUNT(*) FROM rate_limit_events WHERE email = $1",
+        [testEmail],
+      );
+      expect(parseInt(countRows[0].count)).toBe(1);
 
         // Small delay between rounds to avoid connection pool exhaustion
         await new Promise((resolve) => setTimeout(resolve, 10));
@@ -133,7 +167,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       // Send 25 concurrent requests (exceeds limit of 20)
       // Pool gives each query its own connection → true concurrency
       const requests = Array.from({ length: 25 }, (_, i) =>
-        pool.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
+        queryAsServiceRole("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
           limiterKey,
           "ip_hourly",
           20,
@@ -170,7 +204,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       ).toBe(true);
 
       // Verify exactly 20 events recorded for this IP
-      const { rows: countRows } = await pool.query(
+      const { rows: countRows } = await queryAsServiceRole(
         "SELECT COUNT(*) FROM rate_limit_events WHERE limiter_key = $1",
         [limiterKey],
       );
@@ -184,7 +218,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       // Instance 1: Use first 10 requests (concurrent)
       // Pool gives each query its own connection → simulates separate instances
       const batch1 = Array.from({ length: 10 }, (_, i) =>
-        pool.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
+        queryAsServiceRole("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
           limiterKey,
           "ip_hourly",
           20,
@@ -203,7 +237,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
 
       // Instance 2: Use next 10 requests (concurrent)
       const batch2 = Array.from({ length: 10 }, (_, i) =>
-        pool.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
+        queryAsServiceRole("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
           limiterKey,
           "ip_hourly",
           20,
@@ -221,7 +255,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       expect(data2.every((r: { allowed: boolean }) => r.allowed)).toBe(true);
 
       // Instance 3: 21st request should be denied
-      const result3 = await pool.query(
+      const result3 = await queryAsServiceRole(
         "SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)",
         [
           limiterKey,
@@ -246,7 +280,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       const limiterKey = `email:${testEmail}`;
 
       // First request: should be allowed
-      const result1 = await pool.query(
+      const result1 = await queryAsServiceRole(
         "SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)",
         [
           limiterKey,
@@ -262,7 +296,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       expect(data1.allowed).toBe(true);
 
       // Second request: should be denied (email limit)
-      const result2 = await pool.query(
+      const result2 = await queryAsServiceRole(
         "SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)",
         [
           limiterKey,
@@ -279,13 +313,13 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       expect(data2.reason).toBe("email_limited");
 
       // Simulate window expiry by updating event timestamp to 25 hours ago
-      await pool.query(
+      await queryAsServiceRole(
         "UPDATE rate_limit_events SET event_time = NOW() - INTERVAL '25 hours' WHERE email = $1",
         [testEmail],
       );
 
       // Third request: should be allowed again (old event outside window)
-      const result3 = await pool.query(
+      const result3 = await queryAsServiceRole(
         "SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)",
         [
           limiterKey,
