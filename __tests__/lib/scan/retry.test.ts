@@ -53,7 +53,7 @@ describe("home-fetch retry classification", () => {
     expect(plan.retry).toBe(true);
     expect(plan.userAgent).toBe(RETRY_USER_AGENT);
     expect(plan.userAgent).toBe(
-      "AttorneySiteRescueBot/0.1-placeholder (retry; +https://example.com/attorney-site-rescue/crawler-info-placeholder; crawler-placeholder@example.com)",
+      "AttorneySiteRescueBot/0.1-placeholder (retry; +https://example.com/attorney-site-rescue/crawler-info-placeholder; audit@attorneysiterescue.com)",
     );
     expect(plan.delayMs).toBeGreaterThan(0);
   });
