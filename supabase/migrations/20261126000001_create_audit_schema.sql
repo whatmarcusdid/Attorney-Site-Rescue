@@ -292,3 +292,37 @@ CREATE TRIGGER audit_state_updated_at
   EXECUTE FUNCTION update_audit_state_timestamp();
 
 COMMENT ON FUNCTION update_audit_state_timestamp IS 'Auto-update audit_state.updated_at on row modification.';
+
+-- =============================================================================
+-- ROW LEVEL SECURITY
+-- =============================================================================
+-- Enable RLS on all tables to prevent unauthorized access via PostgREST.
+-- Supabase exposes public schema to anon/authenticated roles through PostgREST.
+-- No policies = no access for anon/authenticated. Service role bypasses RLS.
+
+ALTER TABLE audits ENABLE ROW LEVEL SECURITY;
+ALTER TABLE check_results ENABLE ROW LEVEL SECURITY;
+ALTER TABLE section_results ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reports ENABLE ROW LEVEL SECURITY;
+ALTER TABLE rate_limit_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE scan_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_state ENABLE ROW LEVEL SECURITY;
+
+COMMENT ON TABLE audits IS 'RLS enabled. Service role only (no policies for anon/authenticated).';
+COMMENT ON TABLE check_results IS 'RLS enabled. Service role only.';
+COMMENT ON TABLE section_results IS 'RLS enabled. Service role only.';
+COMMENT ON TABLE reports IS 'RLS enabled. Service role only.';
+COMMENT ON TABLE rate_limit_events IS 'RLS enabled. Service role only.';
+COMMENT ON TABLE scan_events IS 'RLS enabled. Service role only.';
+COMMENT ON TABLE audit_state IS 'RLS enabled. Service role only.';
+
+-- Grant necessary permissions to service_role (if it exists)
+-- Service role needs ALL PRIVILEGES to bypass RLS and perform operations
+DO $$
+BEGIN
+  IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'service_role') THEN
+    GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO service_role;
+    GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO service_role;
+    GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO service_role;
+  END IF;
+END $$;

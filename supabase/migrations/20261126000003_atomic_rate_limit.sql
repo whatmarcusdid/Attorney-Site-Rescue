@@ -2,15 +2,15 @@
 -- Migration: 20261126000003_atomic_rate_limit
 -- For: B3 shared-store rate limiter
 --
--- Strategy: PostgreSQL advisory locks (session-level)
+-- Strategy: PostgreSQL advisory locks (transaction-scoped)
 -- - Faster than row locks (no actual row locking overhead)
--- - Automatically released on connection close
+-- - Automatically released on transaction end
 -- - Prevents concurrent requests from both passing the same limit
 --
 -- Why advisory locks over SELECT FOR UPDATE:
 -- 1. No actual row to lock before the event exists
 -- 2. Faster: no row-level lock overhead
--- 3. Automatic cleanup: lock released when function returns
+-- 3. Automatic cleanup: lock released when transaction ends
 -- 4. No deadlock risk: single lock per limiter_key
 --
 -- How it works:
@@ -18,7 +18,10 @@
 -- 2. Count events in rolling window
 -- 3. If under limit, insert event and return allowed
 -- 4. If at/over limit, return denied
--- 5. Lock auto-released when function returns
+-- 5. Lock auto-released when transaction ends (pg_advisory_xact_lock)
+--
+-- Security: SECURITY INVOKER with explicit search_path
+-- Only service_role can EXECUTE (anon/authenticated revoked)
 
 CREATE OR REPLACE FUNCTION check_and_record_rate_limit(
   p_limiter_key TEXT,
@@ -28,7 +31,11 @@ CREATE OR REPLACE FUNCTION check_and_record_rate_limit(
   p_client_ip INET DEFAULT NULL,
   p_email TEXT DEFAULT NULL,
   p_user_agent TEXT DEFAULT NULL
-) RETURNS JSONB AS $$
+) RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public, pg_temp
+AS $$
 DECLARE
   v_lock_key BIGINT;
   v_event_count INTEGER;
@@ -97,9 +104,33 @@ BEGIN
     'limit', p_limit
   );
   
-  -- Advisory lock automatically released when function returns
+  -- Advisory lock automatically released when transaction ends
 END;
-$$ LANGUAGE plpgsql;
+$$;
 
 COMMENT ON FUNCTION check_and_record_rate_limit IS 
-  'Atomically checks rate limit and records event. Uses advisory locks to prevent concurrent requests from both passing the same limit.';
+  'Atomically checks rate limit and records event. Uses advisory locks to prevent concurrent requests from both passing the same limit. SECURITY INVOKER with explicit search_path.';
+
+-- =============================================================================
+-- FUNCTION SECURITY
+-- =============================================================================
+-- Revoke from PUBLIC, anon, authenticated. Grant to service_role only.
+-- Prevents unauthorized rate limit bypass via PostgREST.
+
+REVOKE EXECUTE ON FUNCTION check_and_record_rate_limit(TEXT, TEXT, INTEGER, INTEGER, INET, TEXT, TEXT) FROM PUBLIC;
+
+-- Revoke/grant for Supabase roles (only if they exist)
+DO $$
+BEGIN
+  IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'anon') THEN
+    REVOKE EXECUTE ON FUNCTION check_and_record_rate_limit(TEXT, TEXT, INTEGER, INTEGER, INET, TEXT, TEXT) FROM anon;
+  END IF;
+  
+  IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'authenticated') THEN
+    REVOKE EXECUTE ON FUNCTION check_and_record_rate_limit(TEXT, TEXT, INTEGER, INTEGER, INET, TEXT, TEXT) FROM authenticated;
+  END IF;
+  
+  IF EXISTS (SELECT FROM pg_roles WHERE rolname = 'service_role') THEN
+    GRANT EXECUTE ON FUNCTION check_and_record_rate_limit(TEXT, TEXT, INTEGER, INTEGER, INET, TEXT, TEXT) TO service_role;
+  END IF;
+END $$;
