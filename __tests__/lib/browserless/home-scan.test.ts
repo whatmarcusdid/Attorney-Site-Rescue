@@ -279,6 +279,215 @@ describe("scanHomePage", () => {
     expect(lateClose).toHaveBeenCalled();
   });
 
+  it("returns FIRST_RESULTS_BUDGET and never calls goto with a non-positive timeout", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    let clock = 0;
+    const session = mockSession({
+      goto: jest.fn(async (_url: string, options?: { timeout?: number }) => {
+        const timeout = options?.timeout ?? 0;
+        const waitMs = timeout > 0 ? timeout : 30_000;
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        return {
+          status: () => 200,
+          url: () => "https://example.com/",
+          request: () => ({ redirectChain: () => [] }),
+        };
+      }),
+    });
+    session.setUserAgent.mockImplementation(async () => {
+      clock = URL_SAFETY_BOUNDS.firstResultsBudgetMs;
+    });
+
+    const result = await scanHomePage("https://example.com", {
+      now: () => clock,
+    });
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+      stage: "goto",
+    });
+    if (result.outcome === "partial") {
+      expect(result.elapsedMs).toBeLessThanOrEqual(
+        URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      );
+    }
+    expect(session.goto).not.toHaveBeenCalled();
+    for (const call of session.goto.mock.calls) {
+      const timeout = (call[1] as { timeout?: number } | undefined)?.timeout;
+      expect(timeout).toBeGreaterThan(0);
+    }
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it("cuts off a slow connect at the time left and closes it if it resolves late", async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const lateClose = jest.fn().mockResolvedValue(undefined);
+    connectMock().mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            resolve({
+              newPage: jest.fn(),
+              close: lateClose,
+            });
+          }, 30_000);
+        }),
+    );
+
+    const pending = scanHomePage("https://example.com", {
+      now: () => Date.now(),
+      lookup: async () => ["93.184.216.34"],
+      probe: async () => {
+        jest.setSystemTime(URL_SAFETY_BOUNDS.firstResultsBudgetMs - 400);
+        return { status: 200 };
+      },
+    });
+    await jest.advanceTimersByTimeAsync(400);
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+      stage: "connect",
+    });
+    if (result.outcome === "partial") {
+      expect(result.elapsedMs).toBeLessThanOrEqual(
+        URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      );
+    }
+    expect(Date.now()).toBeLessThanOrEqual(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    expect(lateClose).not.toHaveBeenCalled();
+
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(lateClose).toHaveBeenCalled();
+  });
+
+  it("cuts off a slow newPage at the time left and closes a late page", async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const pageClose = jest.fn().mockResolvedValue(undefined);
+    const browserClose = jest.fn().mockResolvedValue(undefined);
+    connectMock().mockResolvedValue({
+      newPage: () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            resolve({
+              close: pageClose,
+              setUserAgent: jest.fn().mockResolvedValue(undefined),
+              goto: jest.fn(),
+              setRequestInterception: jest.fn().mockResolvedValue(undefined),
+              on: jest.fn(),
+              mainFrame: () => ({}),
+            });
+          }, 30_000);
+        }),
+      close: browserClose,
+    });
+
+    const pending = scanHomePage("https://example.com", {
+      now: () => Date.now(),
+      lookup: async () => ["93.184.216.34"],
+      probe: async () => {
+        jest.setSystemTime(URL_SAFETY_BOUNDS.firstResultsBudgetMs - 400);
+        return { status: 200 };
+      },
+    });
+    await jest.advanceTimersByTimeAsync(400);
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+      stage: "connect",
+    });
+    if (result.outcome === "partial") {
+      expect(result.elapsedMs).toBeLessThanOrEqual(
+        URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      );
+    }
+    expect(Date.now()).toBeLessThanOrEqual(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    expect(browserClose).toHaveBeenCalled();
+    expect(pageClose).not.toHaveBeenCalled();
+
+    await jest.advanceTimersByTimeAsync(30_000);
+    expect(pageClose).toHaveBeenCalled();
+  });
+
+  it("gives goto a positive timeout no greater than one second when that is all that is left", async () => {
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    let clock = 0;
+    const session = mockSession();
+    session.setUserAgent.mockImplementation(async () => {
+      clock = URL_SAFETY_BOUNDS.firstResultsBudgetMs - 1_000;
+    });
+
+    await scanHomePage("https://example.com", { now: () => clock });
+
+    const timeout = (
+      session.goto.mock.calls[0]?.[1] as { timeout?: number } | undefined
+    )?.timeout;
+    expect(timeout).toBeGreaterThan(0);
+    expect(timeout).toBeLessThanOrEqual(1_000);
+  });
+
+  it("returns FIRST_RESULTS_BUDGET when setUserAgent hangs past the deadline", async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession();
+    session.setUserAgent.mockImplementation(() => new Promise(() => undefined));
+
+    const pending = scanHomePage("https://example.com", {
+      now: () => Date.now(),
+    });
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+    });
+    if (result.outcome === "partial") {
+      expect(result.elapsedMs).toBeLessThanOrEqual(
+        URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      );
+    }
+    expect(Date.now()).toBeLessThanOrEqual(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    expect(session.close).toHaveBeenCalled();
+  });
+
+  it("returns FIRST_RESULTS_BUDGET when request interception setup hangs past the deadline", async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(0);
+    process.env.BROWSERLESS_API_KEY = FAKE_KEY;
+    const session = mockSession();
+    session.setRequestInterception.mockImplementation(
+      () => new Promise(() => undefined),
+    );
+
+    const pending = scanHomePage("https://example.com", {
+      now: () => Date.now(),
+    });
+    await jest.advanceTimersByTimeAsync(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    const result = await pending;
+
+    expect(result).toMatchObject({
+      outcome: "partial",
+      reason: "FIRST_RESULTS_BUDGET",
+    });
+    if (result.outcome === "partial") {
+      expect(result.elapsedMs).toBeLessThanOrEqual(
+        URL_SAFETY_BOUNDS.firstResultsBudgetMs,
+      );
+    }
+    expect(Date.now()).toBeLessThanOrEqual(URL_SAFETY_BOUNDS.firstResultsBudgetMs);
+    expect(session.close).toHaveBeenCalled();
+  });
+
   it("returns partial for HTTP 404 and does not run axe", async () => {
     process.env.BROWSERLESS_API_KEY = FAKE_KEY;
     const session = mockSession({ status: 404 });
