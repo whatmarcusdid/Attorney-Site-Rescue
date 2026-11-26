@@ -16,7 +16,7 @@
 
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore - pg types not installed (dev dependency only)
-import { Client } from "pg";
+import { Pool } from "pg";
 
 const TEST_DB_URL =
   process.env.TEST_DATABASE_URL ||
@@ -26,14 +26,17 @@ const TEST_DB_URL =
 const describeIfDb = process.env.RUN_INTEGRATION_TESTS ? describe : describe.skip;
 
 describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
-  let client: Client;
+  let pool: Pool;
 
   beforeAll(async () => {
-    client = new Client({ connectionString: TEST_DB_URL });
-    await client.connect();
+    // Pool allows concurrent connections (each query gets its own connection)
+    pool = new Pool({
+      connectionString: TEST_DB_URL,
+      max: 30, // Support up to 30 concurrent requests
+    });
 
     // Verify function exists
-    const { rows } = await client.query(
+    const { rows } = await pool.query(
       "SELECT 1 FROM pg_proc WHERE proname = 'check_and_record_rate_limit'",
     );
     if (rows.length === 0) {
@@ -45,65 +48,82 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
 
   afterAll(async () => {
     // Cleanup test events
-    await client.query(
+    await pool.query(
       "DELETE FROM rate_limit_events WHERE email LIKE 'test%' OR limiter_key LIKE 'ip:203.0.113.%'",
     );
-    await client.end();
+    await pool.end();
   });
 
   beforeEach(async () => {
     // Clean up before each test
-    await client.query(
+    await pool.query(
       "DELETE FROM rate_limit_events WHERE email LIKE 'test-%' OR limiter_key LIKE 'ip:203.0.113.%'",
     );
   });
 
   describe("Concurrent requests (atomic safety)", () => {
-    it("only allows 1 email per 24h even with concurrent double submit", async () => {
-      const testEmail = `test-concurrent-${Date.now()}@example.com`;
-      const testIp = "203.0.113.100";
-      const limiterKey = `email:${testEmail}`;
+    it("only allows 1 email per 24h even with concurrent double submit (20 rounds)", async () => {
+      // Run 20 rounds to catch intermittent race conditions
+      // Without advisory lock, some rounds would let both requests pass
+      const rounds = 20;
+      let totalRounds = 0;
+      let passedRounds = 0;
 
-      // Simulate double submit: two requests at exact same time
-      const [result1, result2] = await Promise.all([
-        client.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
-          limiterKey,
-          "email_daily",
-          1,
-          24 * 60 * 60 * 1000,
-          testIp,
-          testEmail,
-          "test-agent",
-        ]),
-        client.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
-          limiterKey,
-          "email_daily",
-          1,
-          24 * 60 * 60 * 1000,
-          testIp,
-          testEmail,
-          "test-agent",
-        ]),
-      ]);
+      for (let round = 0; round < rounds; round++) {
+        const testEmail = `test-concurrent-${Date.now()}-${round}@example.com`;
+        const testIp = "203.0.113.100";
+        const limiterKey = `email:${testEmail}`;
 
-      const data1 = result1.rows[0].check_and_record_rate_limit;
-      const data2 = result2.rows[0].check_and_record_rate_limit;
+        // Simulate double submit: two requests at exact same time
+        // Pool gives each query its own connection → true concurrency
+        const [result1, result2] = await Promise.all([
+          pool.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
+            limiterKey,
+            "email_daily",
+            1,
+            24 * 60 * 60 * 1000,
+            testIp,
+            testEmail,
+            "test-agent",
+          ]),
+          pool.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
+            limiterKey,
+            "email_daily",
+            1,
+            24 * 60 * 60 * 1000,
+            testIp,
+            testEmail,
+            "test-agent",
+          ]),
+        ]);
 
-      // Exactly one should be allowed
-      const allowedCount = (data1.allowed ? 1 : 0) + (data2.allowed ? 1 : 0);
-      expect(allowedCount).toBe(1);
+        const data1 = result1.rows[0].check_and_record_rate_limit;
+        const data2 = result2.rows[0].check_and_record_rate_limit;
 
-      // One should be denied (email_limited)
-      const deniedResults = [data1, data2].filter((r) => !r.allowed);
-      expect(deniedResults.length).toBe(1);
-      expect(deniedResults[0].reason).toBe("email_limited");
+        // Count how many were allowed
+        const allowedCount = (data1.allowed ? 1 : 0) + (data2.allowed ? 1 : 0);
+        
+        totalRounds++;
+        if (allowedCount === 1) {
+          passedRounds++;
+        }
 
-      // Verify only 1 event was recorded
-      const { rows: countRows } = await client.query(
-        "SELECT COUNT(*) FROM rate_limit_events WHERE email = $1",
-        [testEmail],
-      );
-      expect(parseInt(countRows[0].count)).toBe(1);
+        // Exactly one should be allowed in every round
+        expect(allowedCount).toBe(1);
+
+        // Verify only 1 event was recorded
+        const { rows: countRows } = await pool.query(
+          "SELECT COUNT(*) FROM rate_limit_events WHERE email = $1",
+          [testEmail],
+        );
+        expect(parseInt(countRows[0].count)).toBe(1);
+
+        // Small delay between rounds to avoid connection pool exhaustion
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+
+      // All rounds should pass with advisory lock
+      expect(passedRounds).toBe(totalRounds);
     });
 
     it("allows exactly 20 IP requests even with concurrent bursts", async () => {
@@ -111,8 +131,9 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       const limiterKey = `ip:${testIp}`;
 
       // Send 25 concurrent requests (exceeds limit of 20)
+      // Pool gives each query its own connection → true concurrency
       const requests = Array.from({ length: 25 }, (_, i) =>
-        client.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
+        pool.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
           limiterKey,
           "ip_hourly",
           20,
@@ -149,7 +170,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       ).toBe(true);
 
       // Verify exactly 20 events recorded for this IP
-      const { rows: countRows } = await client.query(
+      const { rows: countRows } = await pool.query(
         "SELECT COUNT(*) FROM rate_limit_events WHERE limiter_key = $1",
         [limiterKey],
       );
@@ -160,9 +181,10 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       const testIp = `203.0.113.${Math.floor(Math.random() * 200) + 10}`;
       const limiterKey = `ip:${testIp}`;
 
-      // Instance 1: Use first 10 requests
+      // Instance 1: Use first 10 requests (concurrent)
+      // Pool gives each query its own connection → simulates separate instances
       const batch1 = Array.from({ length: 10 }, (_, i) =>
-        client.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
+        pool.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
           limiterKey,
           "ip_hourly",
           20,
@@ -179,9 +201,9 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       );
       expect(data1.every((r: { allowed: boolean }) => r.allowed)).toBe(true);
 
-      // Instance 2: Use next 10 requests
+      // Instance 2: Use next 10 requests (concurrent)
       const batch2 = Array.from({ length: 10 }, (_, i) =>
-        client.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
+        pool.query("SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)", [
           limiterKey,
           "ip_hourly",
           20,
@@ -199,7 +221,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       expect(data2.every((r: { allowed: boolean }) => r.allowed)).toBe(true);
 
       // Instance 3: 21st request should be denied
-      const result3 = await client.query(
+      const result3 = await pool.query(
         "SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)",
         [
           limiterKey,
@@ -224,7 +246,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       const limiterKey = `email:${testEmail}`;
 
       // First request: should be allowed
-      const result1 = await client.query(
+      const result1 = await pool.query(
         "SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)",
         [
           limiterKey,
@@ -240,7 +262,7 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       expect(data1.allowed).toBe(true);
 
       // Second request: should be denied (email limit)
-      const result2 = await client.query(
+      const result2 = await pool.query(
         "SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)",
         [
           limiterKey,
@@ -257,13 +279,13 @@ describeIfDb("Rate Limiter Integration (Real Postgres)", () => {
       expect(data2.reason).toBe("email_limited");
 
       // Simulate window expiry by updating event timestamp to 25 hours ago
-      await client.query(
+      await pool.query(
         "UPDATE rate_limit_events SET event_time = NOW() - INTERVAL '25 hours' WHERE email = $1",
         [testEmail],
       );
 
       // Third request: should be allowed again (old event outside window)
-      const result3 = await client.query(
+      const result3 = await pool.query(
         "SELECT check_and_record_rate_limit($1, $2, $3, $4, $5, $6, $7)",
         [
           limiterKey,

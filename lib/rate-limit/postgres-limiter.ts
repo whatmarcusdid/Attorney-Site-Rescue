@@ -50,11 +50,9 @@ const RATE_LIMITS = {
  * 1 audit per email (normalized) per 24 hours, regardless of site.
  *
  * Atomicity:
- * - Uses SELECT + INSERT in a single transaction
- * - Two concurrent requests may both see N < limit and both insert
- * - This is acceptable: the limit is a soft threshold, not a hard cap
- * - For strict atomicity, use SELECT FOR UPDATE or advisory locks
- *   (not implemented; would add complexity and lock contention)
+ * Uses atomic Postgres function (check_and_record_rate_limit) with
+ * pg_advisory_xact_lock to prevent race conditions. Two concurrent
+ * requests cannot both pass the same limit.
  *
  * @param clientIp - Client IP address (from x-forwarded-for or x-real-ip)
  * @param email - User email (will be normalized)
