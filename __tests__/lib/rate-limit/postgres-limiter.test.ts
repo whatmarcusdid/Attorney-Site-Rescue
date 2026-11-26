@@ -13,7 +13,7 @@ const mockCreateAdminClient = createAdminClient as jest.MockedFunction<
 >;
 
 describe("checkRateLimit", () => {
-  let mockSupabase: any;
+  let mockSupabase: ReturnType<typeof createAdminClient>;
 
   beforeEach(() => {
     jest.clearAllMocks();

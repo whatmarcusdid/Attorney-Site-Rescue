@@ -108,7 +108,7 @@ async function checkIpLimit(
   const windowStart = new Date(Date.now() - RATE_LIMITS.ip.windowMs);
 
   // Count events in the rolling window
-  const { data, error, count } = await supabase
+  const { error, count } = await supabase
     .from("rate_limit_events")
     .select("event_id", { count: "exact", head: true })
     .eq("limiter_key", limiterKey)
@@ -161,7 +161,7 @@ async function checkEmailLimit(
   const windowStart = new Date(Date.now() - RATE_LIMITS.email.windowMs);
 
   // Count events in the rolling window
-  const { data, error, count } = await supabase
+  const { error, count } = await supabase
     .from("rate_limit_events")
     .select("event_id", { count: "exact", head: true })
     .eq("limiter_key", limiterKey)
